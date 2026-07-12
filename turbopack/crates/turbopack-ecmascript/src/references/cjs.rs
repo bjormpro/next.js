@@ -15,7 +15,10 @@ use turbopack_core::{
     module::Module,
     reference::ModuleReference,
     reference_type::CommonJsReferenceSubType,
-    resolve::{ModuleResolveResult, ResolveErrorMode, origin::ResolveOrigin, parse::Request},
+    resolve::{
+        BindingUsage, ExportUsage, ImportUsage, ModuleResolveResult, ResolveErrorMode,
+        origin::ResolveOrigin, parse::Request,
+    },
 };
 use turbopack_resolve::ecmascript::cjs_resolve;
 
@@ -95,6 +98,7 @@ pub struct CjsRequireAssetReference {
     error_mode: ResolveErrorMode,
     chunking_type_attribute: Option<SpecifiedChunkingType>,
     resolve_override: Option<ResolvedVc<Box<dyn Module>>>,
+    usage: ExportUsage,
 }
 
 impl CjsRequireAssetReference {
@@ -105,6 +109,7 @@ impl CjsRequireAssetReference {
         error_mode: ResolveErrorMode,
         chunking_type_attribute: Option<SpecifiedChunkingType>,
         resolve_override: Option<ResolvedVc<Box<dyn Module>>>,
+        usage: ExportUsage,
     ) -> Self {
         CjsRequireAssetReference {
             origin,
@@ -113,6 +118,7 @@ impl CjsRequireAssetReference {
             error_mode,
             chunking_type_attribute,
             resolve_override,
+            usage,
         }
     }
 }
@@ -144,6 +150,13 @@ impl ModuleReference for CjsRequireAssetReference {
             },
             |c| c.as_chunking_type(false, false),
         )
+    }
+
+    fn binding_usage(&self) -> BindingUsage {
+        BindingUsage {
+            import: ImportUsage::TopLevel,
+            export: self.usage.clone(),
+        }
     }
 
     fn source(&self) -> Option<IssueSource> {
