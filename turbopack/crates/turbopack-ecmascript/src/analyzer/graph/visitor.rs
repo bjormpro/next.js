@@ -28,6 +28,7 @@ use crate::{
         graph::{ConditionalKind, Effect, EffectArg, EffectsBlock, EvalContext, VarGraph},
         is_unresolved_id,
     },
+    chunk::CjsStaticExports,
     code_gen::CodeGen,
     references::{
         AstPath,
@@ -580,15 +581,23 @@ mod analyzer_state {
             }
         }
 
-        /// Returns the removable writes and whether the `__esModule` flag is set.
-        pub(super) fn droppable_cjs_exports(
+        /// Returns the removable writes and whether the `__esModule` flag is set, plus
+        /// the static-exports for scope hoisting.
+        pub(super) fn cjs_exports_analysis(
             &mut self,
-        ) -> Option<(Vec<DroppableCjsExportAssignment>, bool)> {
-            let c = self.state.cjs_exports.take()?;
-            if c.writes.is_empty() {
-                return None;
-            }
-            Some((c.writes, c.has_es_module))
+        ) -> (
+            Option<(Vec<DroppableCjsExportAssignment>, bool)>,
+            Option<CjsStaticExports>,
+        ) {
+            let Some(c) = self.state.cjs_exports.take() else {
+                return (None, None);
+            };
+            let static_exports = CjsStaticExports {
+                export_names: c.writes.iter().map(|w| w.name.clone()).collect(),
+                has_es_module: c.has_es_module,
+            };
+            let drops = (!c.writes.is_empty()).then_some((c.writes, c.has_es_module));
+            (drops, Some(static_exports))
         }
 
         /// Whether `target` is a static named CommonJS export write —
@@ -2203,11 +2212,14 @@ impl VisitAstPath for Analyzer<'_, '_> {
             .extend(self.arena, take(&mut self.hoisted_effects));
         self.data.effects = take(&mut self.effects).into_iter().collect();
 
-        // Emit the CommonJS unused-export drop code-gen, if any.
-        if let Some((drops, has_es_module)) = self.droppable_cjs_exports() {
+        // Emit the CommonJS unused-export drop code-gen, if any, and surface the
+        // static-exports for scope hoisting.
+        let (drops, cjs_static_exports) = self.cjs_exports_analysis();
+        if let Some((drops, has_es_module)) = drops {
             self.code_gens
                 .push(CjsExportsDropCodeGen::new(drops, has_es_module).into());
         }
+        self.data.cjs_static_exports = cjs_static_exports;
 
         self.data.code_gens = take(&mut self.code_gens);
     }
