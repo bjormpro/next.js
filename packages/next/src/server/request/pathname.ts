@@ -16,7 +16,7 @@ import {
   type PrerenderStorePPR,
 } from '../app-render/work-unit-async-storage.external'
 import {
-  makeHangingPromise,
+  makeFallbackParamsHangingPromise,
   RENDER_STAGES_BY_DATA_KIND,
 } from '../dynamic-rendering-utils'
 import { InvariantError } from '../../shared/lib/invariant-error'
@@ -96,10 +96,14 @@ function createPrerenderPathname(
     case 'prerender': {
       const fallbackParams = prerenderStore.fallbackRouteParams
       if (fallbackParams && fallbackParams.size > 0) {
-        return makeHangingPromise<string>(
+        // The pathname only hangs when there are fallback params, and a
+        // concrete (ISR-upgraded) prerender resolves it — so this access is
+        // fallback-param data for the static-prefetch hint.
+        return makeFallbackParamsHangingPromise<string>(
           prerenderStore.renderSignal,
           workStore.route,
-          '`pathname`'
+          '`pathname`',
+          prerenderStore
         )
       }
       break
