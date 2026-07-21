@@ -1,9 +1,9 @@
 use anyhow::Result;
 use bincode::{Decode, Encode};
 use swc_core::{
-    common::util::take::Take,
+    common::{DUMMY_SP, util::take::Take},
     ecma::{
-        ast::{CallExpr, Expr, ExprOrSpread, Lit, Prop, PropOrSpread},
+        ast::{CallExpr, Expr, ExprOrSpread, Lit, ObjectLit, Prop, PropOrSpread, SpreadElement},
         utils::prop_name_eq,
     },
     quote,
@@ -411,10 +411,9 @@ impl From<CjsRequireCacheAccess> for CodeGen {
     }
 }
 
-/// Removes each named `exports.NAME = …` write (or `Object.defineProperty`
-/// export) the module graph proved unused. Built by the analyzer for
-/// statically-analyzable CommonJS modules; recognition happens inline during the
-/// walk (see `analyzer::graph::visitor`).
+/// Removes each named CommonJS export the module graph proved unused. Built by the
+/// analyzer for statically-analyzable CommonJS modules; recognition happens inline
+/// during the walk (see `analyzer::graph::visitor`).
 #[derive(
     PartialEq, Eq, TraceRawVcs, ValueDebugFormat, NonLocalValue, Hash, Debug, Encode, Decode,
 )]
@@ -425,15 +424,39 @@ pub struct CjsExportsDropCodeGen {
     has_es_module: bool,
 }
 
-/// A single named CommonJS export write.
+/// How a recognized CommonJS export is written, and thus how it's dropped.
+#[derive(
+    PartialEq,
+    Eq,
+    TraceRawVcs,
+    ValueDebugFormat,
+    NonLocalValue,
+    Hash,
+    Debug,
+    Encode,
+    Decode,
+    Clone,
+    Copy,
+)]
+pub enum CjsExportDropKind {
+    /// A standalone `exports.NAME = …` write or `Object.defineProperty(exports, …)`
+    /// call (the assignment is replaced by its value; the define call is removed).
+    Write,
+    /// A property of a `module.exports = { … }` object literal.
+    ObjectLiteralProperty,
+}
+
+/// A single named CommonJS export.
 #[derive(
     PartialEq, Eq, TraceRawVcs, ValueDebugFormat, NonLocalValue, Hash, Debug, Encode, Decode,
 )]
 pub struct DroppableCjsExportAssignment {
     pub name: RcStr,
-    /// Path to the write: an `exports.NAME = …` assignment expression or an
-    /// `Object.defineProperty(exports, "NAME", …)` call.
+    /// Path to the write — an `exports.NAME = …` assignment, an `Object.defineProperty`
+    /// call, or the `module.exports = { … }` assignment (shared by its properties),
+    /// depending on `kind`.
     pub path: AstPath,
+    pub kind: CjsExportDropKind,
 }
 
 impl CjsExportsDropCodeGen {
@@ -470,25 +493,38 @@ impl CjsExportsDropCodeGen {
             if export_usage_info.is_export_used(&drop.name) {
                 continue;
             }
+            let name = drop.name.clone();
+            let kind = drop.kind;
             visitors.push(create_visitor!(
                 drop.path,
                 visit_mut_expr,
                 |expr: &mut Expr| {
-                    match expr {
-                        // `exports.NAME = <value>` → `<value>` (keep side effects).
-                        Expr::Assign(assign) => {
-                            let value = assign.right.take();
-                            *expr = *value;
+                    match kind {
+                        CjsExportDropKind::Write => match expr {
+                            // `exports.NAME = <value>` → `<value>` (keep side effects).
+                            Expr::Assign(assign) => {
+                                let value = assign.right.take();
+                                *expr = *value;
+                            }
+                            // `Object.defineProperty(exports, …)`: keep an eager
+                            // `value`'s side effects; a getter is lazy, drop the call.
+                            Expr::Call(call) => {
+                                *expr = match take_define_property_value(call) {
+                                    Some(value) => *value,
+                                    None => quote!("0" as Expr),
+                                };
+                            }
+                            _ => {}
+                        },
+                        // `module.exports = { …, NAME: v, … }` → drop `NAME`,
+                        // keeping `v`'s side effects in place via `...(void v)`.
+                        CjsExportDropKind::ObjectLiteralProperty => {
+                            if let Expr::Assign(assign) = expr
+                                && let Expr::Object(obj) = &mut *assign.right
+                            {
+                                drop_object_literal_export(obj, &name);
+                            }
                         }
-                        // `Object.defineProperty(exports, …)`: keep an eager
-                        // `value`'s side effects; a getter is lazy, drop the call.
-                        Expr::Call(call) => {
-                            *expr = match take_define_property_value(call) {
-                                Some(value) => *value,
-                                None => quote!("0" as Expr),
-                            };
-                        }
-                        _ => {}
                     }
                 }
             ));
@@ -514,6 +550,34 @@ fn take_define_property_value(call: &mut CallExpr) -> Option<Box<Expr>> {
         };
         prop_name_eq(&kv.key, "value").then(|| kv.value.take())
     })
+}
+
+/// Drops the `name` export from a `module.exports = { … }` literal. A data property
+/// keeps its value's side effects in place via `...(void <value>)` (a no-op spread);
+/// a getter/setter/method has no eager value, so it's removed outright.
+fn drop_object_literal_export(obj: &mut ObjectLit, name: &str) {
+    obj.props = obj
+        .props
+        .take()
+        .into_iter()
+        .filter_map(|prop| {
+            let PropOrSpread::Prop(p) = &prop else {
+                return Some(prop);
+            };
+            let value = match &**p {
+                Prop::Shorthand(id) if id.sym.as_ref() == name => Box::new(Expr::Ident(id.clone())),
+                Prop::KeyValue(kv) if prop_name_eq(&kv.key, name) => kv.value.clone(),
+                Prop::Getter(g) if prop_name_eq(&g.key, name) => return None,
+                Prop::Setter(s) if prop_name_eq(&s.key, name) => return None,
+                Prop::Method(m) if prop_name_eq(&m.key, name) => return None,
+                _ => return Some(prop),
+            };
+            Some(PropOrSpread::Spread(SpreadElement {
+                dot3_token: DUMMY_SP,
+                expr: Box::new(quote!("void ($e)" as Expr, e: Expr = *value)),
+            }))
+        })
+        .collect();
 }
 
 impl From<CjsExportsDropCodeGen> for CodeGen {

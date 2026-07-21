@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "sources": [],
+  "sections": [
+    {"offset": {"line": 4, "column": 0}, "map": {"version":3,"sources":["turbopack:///[project]/turbopack/crates/turbopack-tests/tests/snapshot/cjs-remove-unused-exports/object-literal/input/index.js"],"sourcesContent":["import { used, usedFn } from './lib.js'\n\nconsole.log(used, usedFn())\n"],"names":["console","log"],"mappings":"AAAA;;AAEAA,QAAQC,GAAG,CAAC,2OAAI,EAAE,IAAA,6OAAM"}},
+    {"offset": {"line": 11, "column": 0}, "map": {"version":3,"sources":["turbopack:///[project]/turbopack/crates/turbopack-tests/tests/snapshot/cjs-remove-unused-exports/object-literal/input/lib.js"],"sourcesContent":["// Hand-written / transpiled CJS: named exports declared as a whole-object\n// `module.exports = { … }` literal. Unused pure-valued properties are dropped.\nmodule.exports = {\n  used: 'used-value',\n  unused: 'unused-value',\n  usedFn: function () {\n    return 'used-fn'\n  },\n  unusedFn: function () {\n    return 'unused-fn'\n  },\n}\n"],"names":["module","exports","used","usedFn"],"mappings":"AAAA,0EAA0E;AAC1E,+EAA+E;AAC/EA,OAAOC,OAAO,GAAG;IACfC,MAAM;YACE;IACRC,QAAQ;QACN,OAAO;IACT;YACU;QACR,OAAO;IACT;AACF"}}]
+}
