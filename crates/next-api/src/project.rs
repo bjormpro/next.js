@@ -45,8 +45,8 @@ use turbo_tasks::{
 };
 use turbo_tasks_env::{EnvMap, ProcessEnv};
 use turbo_tasks_fs::{
-    DiskFileSystem, FileContent, FileSystem, FileSystemPath, VirtualFileSystem,
-    canonicalize_to_rcstr, invalidation,
+    DiskFileSystem, DiskWatcherConfig, FileContent, FileSystem, FileSystemPath, VirtualFileSystem,
+    canonicalize_to_rcstr, glob::GlobOptions, invalidation,
 };
 use turbo_unix_path::join_path;
 use turbopack::{
@@ -1077,10 +1077,19 @@ impl Project {
             .unwrap()
             .into();
 
-        Ok(DiskFileSystem::new_with_denied_paths(
+        // Package managers churn `node_modules` heavily during `next dev` (e.g. `pnpm install`).
+        // Extend the watcher's batch delay while those paths are changing so we coalesce the churn
+        // into fewer invalidation passes, reducing CPU usage and transient read errors.
+        let watcher_config = DiskWatcherConfig {
+            extended_batch_delay_glob: Some((rcstr!("**/node_modules/**"), GlobOptions::default())),
+            ..Default::default()
+        };
+
+        Ok(DiskFileSystem::new_with_config(
             PROJECT_FILESYSTEM_NAME,
             *self.root_path,
             vec![denied_path, denied_profiles_path],
+            watcher_config,
         ))
     }
 

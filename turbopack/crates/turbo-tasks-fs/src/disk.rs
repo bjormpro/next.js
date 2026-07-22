@@ -42,7 +42,7 @@ use crate::{
     mutex_map::MutexMap,
     path_map::OrderedPathMapExt,
     retry::{can_retry, retry_blocking, retry_blocking_custom},
-    watcher::DiskWatcher,
+    watcher::{DiskWatcher, DiskWatcherConfig},
 };
 
 /// Validate the path, returning the valid path, a modified-but-now-valid path, or bailing with an
@@ -727,7 +727,7 @@ impl DiskFileSystem {
     /// This API does not canonicalize itself, as that requires IO operations (e.g. symlink
     /// resolution) which should (ideally) not be cached.
     pub fn new(name: RcStr, root: Vc<RcStr>) -> Vc<Self> {
-        Self::new_internal(name, root, Vec::new())
+        Self::new_internal(name, root, Vec::new(), DiskWatcherConfig::default())
     }
 
     /// Create a new instance of `DiskFileSystem`. This is the same as [`DiskFileSystem::new`], but
@@ -739,6 +739,17 @@ impl DiskFileSystem {
         root: Vc<RcStr>,
         denied_paths: Vec<RcStr>,
     ) -> Vc<Self> {
+        Self::new_with_config(name, root, denied_paths, DiskWatcherConfig::default())
+    }
+
+    /// Create a new instance of `DiskFileSystem` with a custom [`DiskWatcherConfig`] (and,
+    /// optionally, denied paths — see [`DiskFileSystem::new_with_denied_paths`]).
+    pub fn new_with_config(
+        name: RcStr,
+        root: Vc<RcStr>,
+        denied_paths: Vec<RcStr>,
+        watcher_config: DiskWatcherConfig,
+    ) -> Vc<Self> {
         for denied_path in &denied_paths {
             debug_assert!(!denied_path.is_empty(), "denied_path must not be empty");
             debug_assert!(
@@ -746,7 +757,7 @@ impl DiskFileSystem {
                 "denied_path must be normalized: {denied_path:?}"
             );
         }
-        Self::new_internal(name, root, denied_paths)
+        Self::new_internal(name, root, denied_paths, watcher_config)
     }
 }
 
@@ -757,6 +768,7 @@ impl DiskFileSystem {
         name: RcStr,
         root: Vc<RcStr>,
         denied_paths: Vec<RcStr>,
+        watcher_config: DiskWatcherConfig,
     ) -> Result<Vc<Self>> {
         let root = root.owned().await?;
         let instance = DiskFileSystem {
@@ -769,7 +781,7 @@ impl DiskFileSystem {
                 dir_invalidator_map: InvalidatorMap::new(),
                 read_semaphore: create_read_semaphore(),
                 write_semaphore: create_write_semaphore(),
-                watcher: DiskWatcher::new(),
+                watcher: DiskWatcher::new(watcher_config),
                 denied_paths,
                 turbo_tasks: turbo_tasks_weak(),
                 tokio_handle: Handle::current(),

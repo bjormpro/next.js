@@ -6,35 +6,46 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock,
-        mpsc::{Receiver, TryRecvError, channel},
+        mpsc::{Receiver, RecvTimeoutError, channel},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use bincode::{Decode, Encode};
+use bincode::{
+    Decode, Encode,
+    de::Decoder,
+    enc::Encoder,
+    error::{DecodeError, EncodeError},
+    impl_borrow_decode,
+};
 use bitflags::bitflags;
 use notify::{
     Config, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
     event::{MetadataKind, ModifyKind, RenameMode},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::Serialize;
 use tokio::sync::{RwLock, RwLockWriteGuard};
 use tracing::instrument;
 use turbo_rcstr::RcStr;
 use turbo_tasks::{
-    FxIndexSet, InvalidationReason, InvalidationReasonKind, Invalidator, TurboTasksApi, parallel,
-    spawn_thread, util::StaticOrArc,
+    FxIndexSet, InvalidationReason, InvalidationReasonKind, Invalidator, TurboTasksApi,
+    message_queue::{CompilationEvent, Severity},
+    parallel, spawn_thread,
+    trace::TraceRawVcs,
+    util::StaticOrArc,
 };
 
 use crate::{
     DiskFileSystemInner, format_absolute_fs_path,
+    glob::{Glob, GlobOptions},
     invalidation::{WatchChange, WatchStart},
     invalidator_map::InvalidatorMap,
     path_map::OrderedPathMapExt,
 };
 
-static WATCH_RECURSIVE_MODE: LazyLock<RecursiveMode> = LazyLock::new(|| {
+static DEFAULT_WATCH_RECURSIVE_MODE: LazyLock<RecursiveMode> = LazyLock::new(|| {
     match env::var("TURBO_TASKS_FORCE_WATCH_MODE").as_deref() {
         Ok("recursive") => {
             return RecursiveMode::Recursive;
@@ -62,11 +73,100 @@ static WATCH_RECURSIVE_MODE: LazyLock<RecursiveMode> = LazyLock::new(|| {
     }
 });
 
-#[derive(Encode, Decode)]
+/// Serializable mirror of [`notify::RecursiveMode`] (which doesn't implement the traits required by
+/// [`turbo_tasks::task_input`]).
+#[turbo_tasks::task_input]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, TraceRawVcs, Encode, Decode)]
+pub enum WatchRecursiveMode {
+    Recursive,
+    NonRecursive,
+}
+
+impl From<RecursiveMode> for WatchRecursiveMode {
+    fn from(mode: RecursiveMode) -> Self {
+        match mode {
+            RecursiveMode::Recursive => Self::Recursive,
+            RecursiveMode::NonRecursive => Self::NonRecursive,
+        }
+    }
+}
+
+impl From<WatchRecursiveMode> for RecursiveMode {
+    fn from(mode: WatchRecursiveMode) -> Self {
+        match mode {
+            WatchRecursiveMode::Recursive => Self::Recursive,
+            WatchRecursiveMode::NonRecursive => Self::NonRecursive,
+        }
+    }
+}
+
+/// Tunables for [`DiskWatcher`]. Defaults are appropriate for a generic watcher; consumers (e.g.
+/// a bundler front-end) can raise the extended delay for noisy directories like package-manager
+/// install targets.
+#[turbo_tasks::task_input]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, TraceRawVcs, Encode, Decode)]
+pub struct DiskWatcherConfig {
+    /// Whether the underlying `notify` watcher is set up recursively.
+    pub recursive_mode: WatchRecursiveMode,
+    /// How long to keep a batch of filesystem events open, waiting for more events, before
+    /// flushing invalidations. Batching coalesces bursts (e.g. a `git checkout`) into a single
+    /// invalidation pass and avoids reading half-written files.
+    pub batch_delay: Duration,
+    /// If any path in the current batch matches this glob, [`Self::extended_batch_delay_duration`]
+    /// is used instead of [`Self::batch_delay`] for the rest of the batch.
+    ///
+    /// Stored as the raw pattern + options rather than a compiled [`Glob`] because the compiled
+    /// form (which contains a [`regex::Regex`]) is not a [`turbo_tasks::task_input`]. It is
+    /// compiled once when watching starts.
+    ///
+    /// The glob is matched against **absolute** paths (the paths reported by the underlying
+    /// watcher), not paths relative to the watch root, so a leading `**/` is required to match a
+    /// nested directory (e.g. `**/node_modules/**`). On Windows the platform path separator `\` is
+    /// normalized to `/` before matching; on other platforms the path is matched as-is.
+    pub extended_batch_delay_glob: Option<(RcStr, GlobOptions)>,
+    /// The batch delay used once [`Self::extended_batch_delay_glob`] has matched.
+    pub extended_batch_delay_duration: Duration,
+    /// If a single batch stays open at least this long, emit a [`FilesystemSettlingEvent`]
+    /// compilation event (repeated at this interval) so the user knows why work has stalled.
+    pub compilation_event_delay: Duration,
+}
+
+impl Default for DiskWatcherConfig {
+    fn default() -> Self {
+        Self {
+            recursive_mode: (*DEFAULT_WATCH_RECURSIVE_MODE).into(),
+            batch_delay: Duration::from_millis(10),
+            extended_batch_delay_glob: None,
+            extended_batch_delay_duration: Duration::from_millis(200),
+            compilation_event_delay: Duration::from_secs(3),
+        }
+    }
+}
+
 pub(crate) struct DiskWatcher {
-    #[bincode(skip)]
+    config: DiskWatcherConfig,
+    /// Compiled form of [`DiskWatcherConfig::extended_batch_delay_glob`]. Parsed once in
+    /// [`DiskWatcher::new`] (not serialized).
+    extended_batch_delay_glob: Option<Glob>,
+    /// Not serialized: Always constructed with [`State::new_stopped`]
     state: State,
 }
+
+// Only `config` is persisted. `state` holds the live `notify` watcher, which can't be serialized
+// and must be recreated by `start_watching` anyway.
+impl Encode for DiskWatcher {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        self.config.encode(encoder)
+    }
+}
+
+impl<Context> Decode<Context> for DiskWatcher {
+    fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        Ok(DiskWatcher::new(DiskWatcherConfig::decode(decoder)?))
+    }
+}
+
+impl_borrow_decode!(DiskWatcher);
 
 enum State {
     // Note: Information about if we're a recursive or non-recursive watcher must live outside the
@@ -75,20 +175,14 @@ enum State {
     NonRecursive(RwLock<NonRecursiveState>),
 }
 
-impl Default for State {
-    fn default() -> Self {
-        State::new_stopped()
-    }
-}
-
 enum StateWriteGuard<'a> {
     Recursive(RwLockWriteGuard<'a, RecursiveState>),
     NonRecursive(RwLockWriteGuard<'a, NonRecursiveState>),
 }
 
 impl State {
-    fn new_stopped() -> Self {
-        match *WATCH_RECURSIVE_MODE {
+    fn new_stopped(recursive_mode: RecursiveMode) -> Self {
+        match recursive_mode {
             RecursiveMode::Recursive => Self::Recursive(RwLock::new(RecursiveState::Stopped)),
             RecursiveMode::NonRecursive => {
                 Self::NonRecursive(RwLock::new(NonRecursiveState::Stopped))
@@ -111,8 +205,8 @@ impl State {
     }
 }
 
-/// Used by when [`WATCH_RECURSIVE_MODE`] is [`RecursiveMode::Recursive`] (default on macOS and
-/// Windows).
+/// Used by when [`DiskWatcherConfig::recursive_mode`] is [`RecursiveMode::Recursive`] (default on
+/// macOS and Windows).
 enum RecursiveState {
     /// Used when [`DiskWatcher::start_watching`] hasn't been called yet or after
     /// [`DiskWatcher::stop_watching`] is called.
@@ -123,7 +217,8 @@ enum RecursiveState {
     },
 }
 
-/// Used by when [`WATCH_RECURSIVE_MODE`] is [`RecursiveMode::NonRecursive`] (default on Linux).
+/// Used by when [`DiskWatcherConfig::recursive_mode`] is [`RecursiveMode::NonRecursive`] (default
+/// on Linux).
 enum NonRecursiveState {
     /// Used when [`DiskWatcher::start_watching`] hasn't been called yet or after
     /// [`DiskWatcher::stop_watching`] is called.
@@ -345,9 +440,23 @@ mod non_recursive_helpers {
 }
 
 impl DiskWatcher {
-    pub fn new() -> Self {
+    pub fn new(config: DiskWatcherConfig) -> Self {
+        let state = State::new_stopped(config.recursive_mode.into());
+        // Compile the extended-delay glob up front so an invalid pattern fails loudly at
+        // construction rather than silently disabling the extended delay later.
+        let extended_batch_delay_glob =
+            config
+                .extended_batch_delay_glob
+                .as_ref()
+                .map(|(pattern, opts)| {
+                    Glob::parse(pattern.clone(), *opts).unwrap_or_else(|err| {
+                        panic!("invalid extended_batch_delay_glob {pattern:?}: {err}")
+                    })
+                });
         Self {
-            state: State::new_stopped(),
+            config,
+            extended_batch_delay_glob,
+            state,
         }
     }
 
@@ -491,12 +600,62 @@ impl DiskWatcher {
     ) {
         let mut batch = BatchedInvalidations::new(self.state.recursive_mode());
 
+        // Drains the next event for the current batch. `recv_timeout` returns immediately when an
+        // event is already queued, and otherwise sleeps until the batch's wake time before
+        // reporting a timeout. Batching coalesces bursts (e.g. a `git checkout`) and avoids reads
+        // of half-written files. If the batch has stayed open past `compilation_event_delay`, a
+        // `FilesystemSettlingEvent` is emitted (and re-emitted at that interval) so the user learns
+        // why work has stalled.
+        //
+        // The wake time is `min(last_extended_update_at + extended_batch_delay_duration, now +
+        // batch_delay)`: normally we wake after `batch_delay`, but while a path matching
+        // `extended_batch_delay_glob` keeps changing we keep the batch open until
+        // `extended_batch_delay_duration` after the last such change (re-polling every
+        // `batch_delay` so we stay responsive and re-evaluate the settling timer).
+        let drain_next = |last_extended_update_at: Option<Instant>,
+                          batch_started: Option<Instant>,
+                          next_settling_event_at: &mut Duration|
+         -> Result<notify::Result<notify::Event>, RecvTimeoutError> {
+            if let Some(started) = batch_started {
+                let elapsed = started.elapsed();
+                if elapsed >= *next_settling_event_at {
+                    let _guard = fs_inner.tokio_handle.enter();
+                    if let Some(turbo_tasks) = fs_inner.turbo_tasks.upgrade() {
+                        turbo_tasks.send_compilation_event(Arc::new(FilesystemSettlingEvent));
+                    }
+                    *next_settling_event_at += self.config.compilation_event_delay;
+                }
+            }
+            let now = Instant::now();
+            let mut wake = now + self.config.batch_delay;
+            if let Some(last_extended) = last_extended_update_at {
+                wake = wake.min(last_extended + self.config.extended_batch_delay_duration);
+            }
+            rx.recv_timeout(wake.saturating_duration_since(now))
+        };
+
         'outer: loop {
-            let mut event_result = rx.recv().or(Err(TryRecvError::Disconnected));
-            // this inner loop batches events using `try_recv`
+            // Per-batch state. A batch begins when the first event arrives (via the blocking `recv`
+            // below) and ends when `drain_next` times out with no path having matched
+            // `extended_batch_delay_glob` within the last `extended_batch_delay_duration`.
+            //
+            // `last_extended_update_at` is the last time a path matched the extended-delay glob;
+            // it keeps the batch open (see `drain_next`). `batch_started` drives the periodic
+            // `FilesystemSettlingEvent`.
+            let mut last_extended_update_at: Option<Instant> = None;
+            let mut batch_started: Option<Instant> = None;
+            let mut next_settling_event_at = self.config.compilation_event_delay;
+
+            // Block indefinitely for the first event of a batch; the inner loop then drains any
+            // events queued behind it with `drain_next`.
+            let mut event_result = rx.recv().map_err(|_| RecvTimeoutError::Disconnected);
             loop {
                 match event_result {
                     Ok(Ok(event)) => {
+                        // Start the batch clock on the first event so `drain_next` can emit a
+                        // settling event if this batch stays open a long time.
+                        batch_started.get_or_insert_with(Instant::now);
+
                         // TODO: We might benefit from some user-facing diagnostics if it rescans
                         // occur frequently (i.e. more than X times in Y minutes)
                         //
@@ -543,6 +702,23 @@ impl DiskWatcher {
                             break;
                         }
 
+                        // Whenever a path matches the extended-delay glob (e.g. a package-manager
+                        // install target), record the time so the batch stays open until
+                        // `extended_batch_delay_duration` after the most recent such change.
+                        if let Some(glob) = &self.extended_batch_delay_glob
+                            && event.paths.iter().any(|path| {
+                                // The glob matches against the absolute path. On Windows, normalize
+                                // the platform separator to `/`; elsewhere the path already uses
+                                // `/`, so match it without an allocation.
+                                let path = path.to_string_lossy();
+                                #[cfg(target_os = "windows")]
+                                let path = path.replace('\\', "/");
+                                glob.matches(&path)
+                            })
+                        {
+                            last_extended_update_at = Some(Instant::now());
+                        }
+
                         batch.add_event(event);
                     }
                     // Error raised by notify watcher itself
@@ -559,28 +735,30 @@ impl DiskWatcher {
                             }
                         }
                     }
-                    Err(TryRecvError::Disconnected) => {
-                        // Sender has been disconnected, which means DiskFileSystem has been dropped
+                    Err(RecvTimeoutError::Timeout) => {
+                        // Keep the batch open while a path matching `extended_batch_delay_glob`
+                        // changed within the last `extended_batch_delay_duration`; `drain_next`
+                        // re-polls every `batch_delay` in that case. Otherwise the batch is
+                        // complete, so break out to invalidate the collected paths.
+                        let still_extending = last_extended_update_at.is_some_and(|t| {
+                            t.elapsed() < self.config.extended_batch_delay_duration
+                        });
+                        if !still_extending {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        // Sender has been disconnected
+                        // which means DiskFileSystem has been dropped
                         // exit thread
                         break 'outer;
                     }
-                    Err(TryRecvError::Empty) => {
-                        // Linux watching is too fast, so we need to throttle it a bit to avoid
-                        // reading wip files
-                        #[cfg(target_os = "linux")]
-                        let delay = Duration::from_millis(10);
-                        #[cfg(not(target_os = "linux"))]
-                        let delay = Duration::from_millis(1);
-                        match rx.recv_timeout(delay) {
-                            Ok(result) => {
-                                event_result = Ok(result);
-                                continue;
-                            }
-                            Err(_) => break,
-                        }
-                    }
                 }
-                event_result = rx.try_recv();
+                event_result = drain_next(
+                    last_extended_update_at,
+                    batch_started,
+                    &mut next_settling_event_at,
+                );
             }
 
             // We need to start watching first before invalidating the changed paths...
@@ -868,6 +1046,32 @@ fn invalidate(
         return;
     }
     invalidator.invalidate(turbo_tasks);
+}
+
+/// Emitted while the watcher is holding a batch of filesystem events open, waiting for frequent
+/// updates (e.g. a running package manager) to settle before invalidating. Because the batch delay
+/// can be extended indefinitely under sustained churn, this event lets consumers surface why work
+/// appears stalled. Re-emitted every [`DiskWatcherConfig::compilation_event_delay`].
+#[derive(Debug, Clone, Serialize)]
+pub struct FilesystemSettlingEvent;
+
+impl CompilationEvent for FilesystemSettlingEvent {
+    fn type_name(&self) -> &'static str {
+        "FilesystemSettlingEvent"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Info
+    }
+
+    fn message(&self) -> String {
+        "Turbopack has seen frequent file updates and is waiting for the filesystem to settle."
+            .to_string()
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
 }
 
 /// Invalidation was caused by a watcher rescan event. This will likely invalidate *every* watched

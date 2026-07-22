@@ -402,6 +402,7 @@ export async function createHotReloaderTurbopack(
       'StartupCacheInvalidationEvent',
       'TimingEvent',
       'SlowFilesystemEvent',
+      'FilesystemSettlingEvent',
       'TraceEvent',
     ],
     parentSpan: hotReloaderSpan,
