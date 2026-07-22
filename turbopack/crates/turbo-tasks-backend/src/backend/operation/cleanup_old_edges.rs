@@ -9,7 +9,7 @@ use crate::{
     backend::{
         TaskDataCategory,
         operation::{
-            AggregatedDataUpdate, ExecuteContext, Operation,
+            AggregatedDataUpdate, ExecuteContext, Operation, TaskAccess,
             aggregation_update::{
                 AggregationUpdateJob, AggregationUpdateQueue, InnerOfUppersLostFollowersJob,
                 get_aggregation_number, get_uppers, is_aggregating_node,
@@ -95,7 +95,11 @@ impl CleanupOldEdgesOperation {
                                     }
                                     _ => true,
                                 });
-                                let mut task = ctx.task(task_id, TaskDataCategory::All);
+                                let mut task = ctx.task(
+                                    task_id,
+                                    TaskDataCategory::All,
+                                    TaskAccess::MaybeCreate,
+                                );
                                 for task_id in children.iter() {
                                     task.remove_children(task_id);
                                 }
@@ -137,7 +141,11 @@ impl CleanupOldEdgesOperation {
                                     }
                                     _ => true,
                                 });
-                                let mut task = ctx.task(task_id, TaskDataCategory::All);
+                                let mut task = ctx.task(
+                                    task_id,
+                                    TaskDataCategory::All,
+                                    TaskAccess::MaybeCreate,
+                                );
                                 let mut emptied_collectables = FxHashSet::default();
                                 for (collectible, count) in collectibles.iter_mut() {
                                     if task
@@ -173,14 +181,22 @@ impl CleanupOldEdgesOperation {
                                     cell,
                                 } = forward;
                                 {
-                                    let mut task = ctx.task(cell_task_id, TaskDataCategory::Data);
+                                    let mut task = ctx.task(
+                                        cell_task_id,
+                                        TaskDataCategory::Data,
+                                        TaskAccess::MaybeCreate,
+                                    );
                                     task.remove_cell_dependents(&CellRef {
                                         task: task_id,
                                         cell,
                                     });
                                 }
                                 {
-                                    let mut task = ctx.task(task_id, TaskDataCategory::Data);
+                                    let mut task = ctx.task(
+                                        task_id,
+                                        TaskDataCategory::Data,
+                                        TaskAccess::MaybeCreate,
+                                    );
                                     task.remove_cell_dependencies(&forward);
                                 }
                             }
@@ -191,7 +207,11 @@ impl CleanupOldEdgesOperation {
                                     cell,
                                 } = forward;
                                 {
-                                    let mut task = ctx.task(cell_task_id, TaskDataCategory::Data);
+                                    let mut task = ctx.task(
+                                        cell_task_id,
+                                        TaskDataCategory::Data,
+                                        TaskAccess::MaybeCreate,
+                                    );
                                     task.remove_cell_dependents_hashed(&(
                                         CellRef {
                                             task: task_id,
@@ -201,7 +221,11 @@ impl CleanupOldEdgesOperation {
                                     ));
                                 }
                                 {
-                                    let mut task = ctx.task(task_id, TaskDataCategory::Data);
+                                    let mut task = ctx.task(
+                                        task_id,
+                                        TaskDataCategory::Data,
+                                        TaskAccess::MaybeCreate,
+                                    );
                                     task.remove_cell_dependencies_hashed(&(forward, key));
                                 }
                             }
@@ -214,11 +238,19 @@ impl CleanupOldEdgesOperation {
                                 )
                                 .entered();
                                 {
-                                    let mut task = ctx.task(output_task_id, TaskDataCategory::Data);
+                                    let mut task = ctx.task(
+                                        output_task_id,
+                                        TaskDataCategory::Data,
+                                        TaskAccess::MaybeCreate,
+                                    );
                                     task.remove_output_dependent(&task_id);
                                 }
                                 {
-                                    let mut task = ctx.task(task_id, TaskDataCategory::Data);
+                                    let mut task = ctx.task(
+                                        task_id,
+                                        TaskDataCategory::Data,
+                                        TaskAccess::MaybeCreate,
+                                    );
                                     task.remove_output_dependencies(&output_task_id);
                                 }
                             }
@@ -227,15 +259,22 @@ impl CleanupOldEdgesOperation {
                                 task: dependent_task_id,
                             }) => {
                                 {
-                                    let mut task =
-                                        ctx.task(dependent_task_id, TaskDataCategory::Data);
+                                    let mut task = ctx.task(
+                                        dependent_task_id,
+                                        TaskDataCategory::Data,
+                                        TaskAccess::MaybeCreate,
+                                    );
                                     task.remove_collectibles_dependents(&(
                                         collectible_type,
                                         task_id,
                                     ));
                                 }
                                 {
-                                    let mut task = ctx.task(task_id, TaskDataCategory::Data);
+                                    let mut task = ctx.task(
+                                        task_id,
+                                        TaskDataCategory::Data,
+                                        TaskAccess::MaybeCreate,
+                                    );
                                     task.remove_collectibles_dependencies(&CollectiblesRef {
                                         collectible_type,
                                         task: dependent_task_id,

@@ -29,7 +29,9 @@ use turbo_tasks::{FxIndexMap, TaskExecutionReason, TaskId, TaskPriority, event::
 use crate::{
     backend::{
         TaskDataCategory,
-        operation::{ExecuteContext, Operation, TaskGuard, invalidate::make_task_dirty},
+        operation::{
+            ExecuteContext, Operation, TaskAccess, TaskGuard, invalidate::make_task_dirty,
+        },
         storage_schema::TaskStorageAccessors,
     },
     data::{ActivenessState, AggregationNumber, CollectibleRef},
@@ -99,7 +101,7 @@ pub fn get_uppers(task: &impl TaskGuard) -> TaskIdVec {
 /// Acquires a `Meta`-category guard for `task_id` and sets `optimization_pending`. Used in
 /// the optimize-queue drop paths when the caller doesn't already hold a guard for the task.
 fn lock_and_mark_optimization_pending(ctx: &mut impl ExecuteContext<'_>, task_id: TaskId) {
-    let mut task = ctx.task(task_id, TaskDataCategory::Meta);
+    let mut task = ctx.task(task_id, TaskDataCategory::Meta, TaskAccess::MaybeCreate);
     task.set_optimization_pending(true);
 }
 
@@ -1617,6 +1619,7 @@ impl AggregationUpdateQueue {
             task_id,
             // For performance reasons this should stay `Meta` and not `All`
             AGGREGATION_UPDATE_CATEGORY,
+            TaskAccess::MustExist,
         );
         self.check_optimization_pending(&upper);
         self.check_optimization_pending(&task);
@@ -1885,6 +1888,7 @@ impl AggregationUpdateQueue {
                 lost_follower_id,
                 // For performance reasons this should stay `Meta` and not `All`
                 AGGREGATION_UPDATE_CATEGORY,
+                TaskAccess::MaybeCreate,
             );
             self.check_optimization_pending(&follower);
 
@@ -1919,6 +1923,7 @@ impl AggregationUpdateQueue {
                             upper_id,
                             // For performance reasons this should stay `Meta` and not `All`
                             AGGREGATION_UPDATE_CATEGORY,
+                            TaskAccess::MaybeCreate,
                         );
                         // STEP 6
                         let diff = data.apply(&mut upper, ctx.should_track_activeness(), self);
@@ -1956,6 +1961,7 @@ impl AggregationUpdateQueue {
                 upper_id,
                 // For performance reasons this should stay `Meta` and not `All`
                 AGGREGATION_UPDATE_CATEGORY,
+                TaskAccess::MaybeCreate,
             );
             let mut is_follower = true;
             let mut removed_follower = false;
@@ -2020,10 +2026,14 @@ impl AggregationUpdateQueue {
             retry += 1;
             if retry > MAX_RETRIES {
                 let lost_follower_description = ctx
-                    .task(lost_follower_id, TaskDataCategory::Data)
+                    .task(
+                        lost_follower_id,
+                        TaskDataCategory::Data,
+                        TaskAccess::MaybeCreate,
+                    )
                     .get_task_description();
                 let upper_description = ctx
-                    .task(upper_id, TaskDataCategory::Data)
+                    .task(upper_id, TaskDataCategory::Data, TaskAccess::MaybeCreate)
                     .get_task_description();
                 panic!(
                     "inner_of_upper_lost_follower is not able to remove follower \
@@ -2056,6 +2066,7 @@ impl AggregationUpdateQueue {
                 lost_follower_id,
                 // For performance reasons this should stay `Meta` and not `All`
                 AGGREGATION_UPDATE_CATEGORY,
+                TaskAccess::MaybeCreate,
             );
             self.check_optimization_pending(&follower);
 
@@ -2135,6 +2146,7 @@ impl AggregationUpdateQueue {
                     upper_id,
                     // For performance reasons this should stay `Meta` and not `All`
                     AGGREGATION_UPDATE_CATEGORY,
+                    TaskAccess::MaybeCreate,
                 );
                 let mut not_a_follower = false;
                 let mut removed_follower = false;
@@ -2199,7 +2211,11 @@ impl AggregationUpdateQueue {
             retry += 1;
             if retry > MAX_RETRIES {
                 let lost_follower_description = ctx
-                    .task(lost_follower_id, TaskDataCategory::Data)
+                    .task(
+                        lost_follower_id,
+                        TaskDataCategory::Data,
+                        TaskAccess::MaybeCreate,
+                    )
                     .get_task_description();
                 let upper_description = upper_ids
                     .iter()
@@ -2207,7 +2223,8 @@ impl AggregationUpdateQueue {
                         format!(
                             "{} ({})",
                             id,
-                            ctx.task(*id, TaskDataCategory::Data).get_task_description()
+                            ctx.task(*id, TaskDataCategory::Data, TaskAccess::MaybeCreate)
+                                .get_task_description()
                         )
                     })
                     .collect::<Vec<_>>()
@@ -2248,6 +2265,7 @@ impl AggregationUpdateQueue {
                     lost_follower_id,
                     // For performance reasons this should stay `Meta` and not `All`
                     AGGREGATION_UPDATE_CATEGORY,
+                    TaskAccess::MaybeCreate,
                 );
                 self.check_optimization_pending(&follower);
 
@@ -2281,6 +2299,7 @@ impl AggregationUpdateQueue {
                             upper_id,
                             // For performance reasons this should stay `Meta` and not `All`
                             AGGREGATION_UPDATE_CATEGORY,
+                            TaskAccess::MaybeCreate,
                         );
                         // STEP 6
                         let diff = data.apply(&mut upper, ctx.should_track_activeness(), self);
@@ -2321,6 +2340,7 @@ impl AggregationUpdateQueue {
                 upper_id,
                 // For performance reasons this should stay `Meta` and not `All`
                 AGGREGATION_UPDATE_CATEGORY,
+                TaskAccess::MaybeCreate,
             );
             swap_retain(&mut lost_follower_ids, |&mut lost_follower_id| {
                 let mut not_a_follower = false;
@@ -2387,7 +2407,7 @@ impl AggregationUpdateQueue {
             retry += 1;
             if retry > MAX_RETRIES {
                 let upper_description = ctx
-                    .task(upper_id, TaskDataCategory::Data)
+                    .task(upper_id, TaskDataCategory::Data, TaskAccess::MaybeCreate)
                     .get_task_description();
                 let lost_followers_description = lost_follower_ids
                     .iter()
@@ -2395,7 +2415,8 @@ impl AggregationUpdateQueue {
                         format!(
                             "{} ({})",
                             id,
-                            ctx.task(*id, TaskDataCategory::Data).get_task_description()
+                            ctx.task(*id, TaskDataCategory::Data, TaskAccess::MaybeCreate)
+                                .get_task_description()
                         )
                     })
                     .collect::<Vec<_>>()
@@ -2440,6 +2461,7 @@ impl AggregationUpdateQueue {
                 new_follower_id,
                 // For performance reasons this should stay `Meta` and not `All`
                 AGGREGATION_UPDATE_CATEGORY,
+                TaskAccess::MaybeCreate,
             );
             get_aggregation_number(&follower)
         };
@@ -2456,6 +2478,7 @@ impl AggregationUpdateQueue {
                     upper_id,
                     // For performance reasons this should stay `Meta` and not `All`
                     AGGREGATION_UPDATE_CATEGORY,
+                    TaskAccess::MaybeCreate,
                 );
                 self.check_optimization_pending(&upper);
                 // decide if it should be an inner or follower
@@ -2528,6 +2551,7 @@ impl AggregationUpdateQueue {
                 new_follower_id,
                 // For performance reasons this should stay `Meta` and not `All`
                 AGGREGATION_UPDATE_CATEGORY,
+                TaskAccess::MaybeCreate,
             );
             let follower_aggregation_number = get_aggregation_number(&new_follower);
 
@@ -2690,6 +2714,7 @@ impl AggregationUpdateQueue {
                     new_follower_id,
                     // For performance reasons this should stay `Meta` and not `All`
                     AGGREGATION_UPDATE_CATEGORY,
+                    TaskAccess::MaybeCreate,
                 );
                 (new_follower_id, count, get_aggregation_number(&follower))
             })
@@ -2710,6 +2735,7 @@ impl AggregationUpdateQueue {
                     upper_id,
                     // For performance reasons this should stay `Meta` and not `All`
                     AGGREGATION_UPDATE_CATEGORY,
+                    TaskAccess::MaybeCreate,
                 );
                 self.check_optimization_pending(&upper);
 
@@ -2808,6 +2834,7 @@ impl AggregationUpdateQueue {
                         new_follower_id,
                         // For performance reasons this should stay `Meta` and not `All`
                         AGGREGATION_UPDATE_CATEGORY,
+                        TaskAccess::MaybeCreate,
                     );
                     let follower_aggregation_number = get_aggregation_number(&new_follower);
 
@@ -2866,6 +2893,7 @@ impl AggregationUpdateQueue {
                 upper_id,
                 // For performance reasons this should stay `Meta` and not `All`
                 AGGREGATION_UPDATE_CATEGORY,
+                TaskAccess::MaybeCreate,
             );
             let diffs = upper_data_updates
                 .into_iter()
@@ -2907,6 +2935,7 @@ impl AggregationUpdateQueue {
                     upper_id,
                     // For performance reasons this should stay `Meta` and not `All`
                     AGGREGATION_UPDATE_CATEGORY,
+                    TaskAccess::MaybeCreate,
                 );
                 is_active = upper.has_activeness();
             }
@@ -2936,6 +2965,7 @@ impl AggregationUpdateQueue {
                 new_follower_id,
                 // For performance reasons this should stay `Meta` and not `All`
                 AGGREGATION_UPDATE_CATEGORY,
+                TaskAccess::MaybeCreate,
             );
             get_aggregation_number(&follower)
         };
@@ -2953,6 +2983,7 @@ impl AggregationUpdateQueue {
                 upper_id,
                 // For performance reasons this should stay `Meta` and not `All`
                 AGGREGATION_UPDATE_CATEGORY,
+                TaskAccess::MaybeCreate,
             );
             self.check_optimization_pending(&upper);
             // decide if it should be an inner or follower
@@ -3022,6 +3053,7 @@ impl AggregationUpdateQueue {
                 new_follower_id,
                 // For performance reasons this should stay `Meta` and not `All`
                 AGGREGATION_UPDATE_CATEGORY,
+                TaskAccess::MaybeCreate,
             );
             let follower_aggregation_number = get_aggregation_number(&new_follower);
 
@@ -3052,6 +3084,7 @@ impl AggregationUpdateQueue {
                             upper_id,
                             // For performance reasons this should stay `Meta` and not `All`
                             AGGREGATION_UPDATE_CATEGORY,
+                            TaskAccess::MaybeCreate,
                         );
                         let diff = data.apply(&mut upper, ctx.should_track_activeness(), self);
                         if !diff.is_empty() {
@@ -3080,6 +3113,7 @@ impl AggregationUpdateQueue {
                             upper_id,
                             // For performance reasons this should stay `Meta` and not `All`
                             AGGREGATION_UPDATE_CATEGORY,
+                            TaskAccess::MaybeCreate,
                         );
                         is_active = upper.has_activeness();
                     }
@@ -3106,6 +3140,7 @@ impl AggregationUpdateQueue {
             task_id,
             // For performance reasons this should stay `Meta` and not `All`
             AGGREGATION_UPDATE_CATEGORY,
+            TaskAccess::MaybeCreate,
         );
         self.check_optimization_pending(&task);
         let state = task.get_activeness_mut_or_insert_with(|| ActivenessState::new(task_id));
@@ -3152,6 +3187,7 @@ impl AggregationUpdateQueue {
             // For performance reasons this should stay Meta and not All.
             // persistent_task_type is now set eagerly in initialize_new_task.
             AGGREGATION_UPDATE_CATEGORY,
+            TaskAccess::MaybeCreate,
         );
         self.check_optimization_pending(&task);
         let state = task.get_activeness_mut_or_insert_with(|| ActivenessState::new(task_id));
@@ -3200,6 +3236,7 @@ impl AggregationUpdateQueue {
             task_id,
             // For performance reasons this should stay `Meta` and not `All`
             AGGREGATION_UPDATE_CATEGORY,
+            TaskAccess::MaybeCreate,
         );
         self.check_optimization_pending(&task);
         let current = task.get_aggregation_number().copied().unwrap_or_default();
@@ -3296,6 +3333,7 @@ impl AggregationUpdateQueue {
             task_id,
             // For performance reasons this should stay `Meta` and not `All`
             TaskDataCategory::Meta,
+            TaskAccess::MaybeCreate,
         );
         if optimization_pending_flag_already_set {
             // Clear the pending flag — this is the only path that does so. We skip the
@@ -3355,6 +3393,7 @@ impl AggregationUpdateQueue {
                     task_id,
                     // For performance reasons this should stay `Meta` and not `All`
                     TaskDataCategory::Meta,
+                    TaskAccess::MaybeCreate,
                 );
                 let n = get_aggregation_number(&task);
                 if is_root_node(n) {

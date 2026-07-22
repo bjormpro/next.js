@@ -15,7 +15,7 @@ use crate::{
     backend::{
         TaskDataCategory,
         operation::{
-            AggregationUpdateQueue, ExecuteContext, Operation, TaskGuard,
+            AggregationUpdateQueue, ExecuteContext, Operation, TaskAccess, TaskGuard,
             invalidate::make_task_dirty_internal,
         },
         storage_schema::TaskStorageAccessors,
@@ -71,7 +71,7 @@ impl UpdateCellOperation {
 
         let content = content.0;
 
-        let mut task = ctx.task(task_id, TaskDataCategory::All);
+        let mut task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
 
         // We need to detect recomputation, because here the content has not actually changed (even
         // if it's not equal to the old content, as not all values implement Eq). We have to
@@ -295,7 +295,11 @@ impl Operation for UpdateCellOperation {
                 } => {
                     if let Some((dependent_task_id, keys)) = dependent_tasks.pop() {
                         let mut make_stale = false;
-                        let dependent = ctx.task(dependent_task_id, TaskDataCategory::All);
+                        let dependent = ctx.task(
+                            dependent_task_id,
+                            TaskDataCategory::All,
+                            TaskAccess::MaybeCreate,
+                        );
                         for key in keys.iter().copied() {
                             let (in_outdated, in_current) = if let Some(k) = key {
                                 let in_outdated = dependent
@@ -352,7 +356,7 @@ impl Operation for UpdateCellOperation {
                     content,
                     ref mut queue,
                 } => {
-                    let mut task = ctx.task(task, TaskDataCategory::Data);
+                    let mut task = ctx.task(task, TaskDataCategory::Data, TaskAccess::MaybeCreate);
 
                     if let Some(content) = content {
                         // This arm only carries the CellId, so resolve the cell's

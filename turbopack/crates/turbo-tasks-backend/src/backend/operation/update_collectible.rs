@@ -8,7 +8,7 @@ use crate::{
         TaskDataCategory,
         operation::{
             AggregatedDataUpdate, AggregationUpdateJob, AggregationUpdateQueue, ExecuteContext,
-            Operation,
+            Operation, TaskAccess,
         },
         storage_schema::TaskStorageAccessors,
     },
@@ -24,7 +24,7 @@ impl UpdateCollectibleOperation {
         mut count: i32,
         mut ctx: impl ExecuteContext<'_>,
     ) {
-        let mut task = ctx.task(task_id, TaskDataCategory::All);
+        let mut task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
         if count < 0
             && task
                 .get_persistent_task_type()

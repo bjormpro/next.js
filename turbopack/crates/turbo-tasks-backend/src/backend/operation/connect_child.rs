@@ -5,7 +5,7 @@ use crate::{
     backend::{
         TaskDataCategory,
         operation::{
-            ExecuteContext, Operation, TaskGuard,
+            ExecuteContext, Operation, TaskAccess, TaskGuard,
             aggregation_update::{AggregationUpdateJob, AggregationUpdateQueue},
         },
         storage_schema::TaskStorageAccessors,
@@ -30,7 +30,11 @@ impl ConnectChildOperation {
         mut ctx: impl ExecuteContext<'_>,
     ) {
         if let Some(parent_task_id) = parent_task_id {
-            let mut parent_task = ctx.task(parent_task_id, TaskDataCategory::Meta);
+            let mut parent_task = ctx.task(
+                parent_task_id,
+                TaskDataCategory::Meta,
+                TaskAccess::MaybeCreate,
+            );
             let Some(InProgressState::InProgress(box InProgressStateInner {
                 new_children, ..
             })) = parent_task.get_in_progress()
@@ -75,7 +79,11 @@ impl ConnectChildOperation {
                 task: child_task_id,
             });
         } else {
-            let mut child_task = ctx.task(child_task_id, TaskDataCategory::Meta);
+            let mut child_task = ctx.task(
+                child_task_id,
+                TaskDataCategory::Meta,
+                TaskAccess::MaybeCreate,
+            );
 
             if !child_task.has_output()
                 && child_task.add_scheduled(
@@ -93,7 +101,11 @@ impl ConnectChildOperation {
         .execute(&mut ctx);
 
         if let Some(parent_task_id) = parent_task_id {
-            let mut parent_task = ctx.task(parent_task_id, TaskDataCategory::Meta);
+            let mut parent_task = ctx.task(
+                parent_task_id,
+                TaskDataCategory::Meta,
+                TaskAccess::MaybeCreate,
+            );
             let Some(InProgressState::InProgress(box InProgressStateInner {
                 new_children, ..
             })) = parent_task.get_in_progress_mut()

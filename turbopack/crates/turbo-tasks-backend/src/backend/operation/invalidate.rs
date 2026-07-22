@@ -8,7 +8,7 @@ use crate::{
     backend::{
         TaskDataCategory,
         operation::{
-            ExecuteContext, Operation, TaskGuard,
+            ExecuteContext, Operation, TaskAccess, TaskGuard,
             aggregation_update::{
                 AggregationUpdateJob, AggregationUpdateQueue, ComputeDirtyAndCleanUpdate,
             },
@@ -93,7 +93,7 @@ pub fn make_task_dirty(
     queue: &mut AggregationUpdateQueue,
     ctx: &mut impl ExecuteContext<'_>,
 ) {
-    let task = ctx.task(task_id, TaskDataCategory::All);
+    let task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
     make_task_dirty_internal(
         task,
         task_id,
@@ -265,7 +265,7 @@ pub fn make_task_dirty_internal(
         let description = EventDescription::new(|| task.get_task_desc_fn());
         if task.add_scheduled(TaskExecutionReason::Invalidated, description) {
             drop(task);
-            let task = ctx.task(task_id, TaskDataCategory::All);
+            let task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
             ctx.schedule_task(task, parent_priority);
         }
     }

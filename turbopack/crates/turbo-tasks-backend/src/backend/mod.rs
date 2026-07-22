@@ -64,9 +64,9 @@ use crate::{
         operation::{
             AggregationUpdateJob, AggregationUpdateQueue, ChildExecuteContext,
             CleanupOldEdgesOperation, ConnectChildOperation, ExecuteContext, ExecuteContextImpl,
-            LeafDistanceUpdateQueue, Operation, OutdatedEdge, TaskGuard, TaskType, TaskTypeRef,
-            connect_children, get_aggregation_number, get_uppers, make_task_dirty_internal,
-            prepare_new_children,
+            LeafDistanceUpdateQueue, Operation, OutdatedEdge, TaskAccess, TaskGuard, TaskType,
+            TaskTypeRef, connect_children, get_aggregation_number, get_uppers,
+            make_task_dirty_internal, prepare_new_children,
         },
         snapshot_coordinator::{OperationGuard, SnapshotCoordinator},
         storage::Storage,
@@ -330,6 +330,19 @@ impl TurboTasksBackend {
         (had_new_data, counts)
     }
 
+    /// Opens `task` with [`TaskAccess::MustExist`] and drops the guard. Test-only hook to exercise
+    /// the non-fabricating existence guarantee: this panics (debug builds) if `task` exists in
+    /// neither memory nor persistent storage (rather than fabricating a blank).
+    #[doc(hidden)]
+    pub fn assert_task_exists_for_testing(
+        &self,
+        task: TaskId,
+        turbo_tasks: &TurboTasks<TurboTasksBackend>,
+    ) {
+        let mut ctx = self.execute_context(turbo_tasks);
+        let _ = ctx.task(task, TaskDataCategory::All, TaskAccess::MustExist);
+    }
+
     fn should_restore(&self) -> bool {
         self.options.storage_mode.is_some()
     }
@@ -382,7 +395,7 @@ impl TurboTasksBackend {
             TaskError::TaskChain(chain) => {
                 let task_id = chain.last().unwrap();
                 let error = {
-                    let task = ctx.task(*task_id, TaskDataCategory::Meta);
+                    let task = ctx.task(*task_id, TaskDataCategory::Meta, TaskAccess::MaybeCreate);
                     if let Some(OutputValue::Error(error)) = task.get_output() {
                         Some(error.clone())
                     } else {
@@ -455,10 +468,18 @@ impl TurboTasksBackend {
             // Having a task_pair here is not optimal, but otherwise this would lead to a race
             // condition. See below.
             // TODO(sokra): solve that in a more performant way.
-            let (task, reader) = ctx.task_pair(task_id, reader_id, TaskDataCategory::All);
+            let (task, reader) = ctx.task_pair(
+                task_id,
+                reader_id,
+                TaskDataCategory::All,
+                TaskAccess::MustExist,
+            );
             (task, Some(reader))
         } else {
-            (ctx.task(task_id, TaskDataCategory::All), None)
+            (
+                ctx.task(task_id, TaskDataCategory::All, TaskAccess::MustExist),
+                None,
+            )
         };
 
         fn listen_to_done_event(
@@ -569,7 +590,8 @@ impl TurboTasksBackend {
                             parent_and_count: Option<(TaskId, i32)>,
                             visited: &mut FxHashSet<TaskId>,
                         ) -> String {
-                            let task = ctx.task(task_id, TaskDataCategory::All);
+                            let task =
+                                ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
                             let is_dirty = task.is_dirty();
                             let in_progress =
                                 task.get_in_progress()
@@ -627,7 +649,11 @@ impl TurboTasksBackend {
 
                                 for (child_task_id, count) in children {
                                     let task_description = ctx
-                                        .task(child_task_id, TaskDataCategory::Data)
+                                        .task(
+                                            child_task_id,
+                                            TaskDataCategory::Data,
+                                            TaskAccess::MaybeCreate,
+                                        )
                                         .get_task_description();
                                     if visited.insert(child_task_id) {
                                         let child_info = get_info(
@@ -826,10 +852,18 @@ impl TurboTasksBackend {
             // Having a task_pair here is not optimal, but otherwise this would lead to a race
             // condition. See below.
             // TODO(sokra): solve that in a more performant way.
-            let (task, reader) = ctx.task_pair(task_id, reader_id, TaskDataCategory::All);
+            let (task, reader) = ctx.task_pair(
+                task_id,
+                reader_id,
+                TaskDataCategory::All,
+                TaskAccess::MustExist,
+            );
             (task, Some(reader))
         } else {
-            (ctx.task(task_id, TaskDataCategory::All), None)
+            (
+                ctx.task(task_id, TaskDataCategory::All, TaskAccess::MustExist),
+                None,
+            )
         };
 
         let content = if final_read_hint {
@@ -1747,7 +1781,7 @@ impl TurboTasksBackend {
             return;
         }
         let mut ctx = self.execute_context(turbo_tasks);
-        let mut task = ctx.task(task_id, TaskDataCategory::Data);
+        let mut task = ctx.task(task_id, TaskDataCategory::Data, TaskAccess::MustExist);
         task.invalidate_serialization();
     }
 
@@ -1768,7 +1802,7 @@ impl TurboTasksBackend {
         turbo_tasks: &TurboTasks<TurboTasksBackend>,
     ) -> String {
         let mut ctx = self.execute_context(turbo_tasks);
-        let task = ctx.task(task_id, TaskDataCategory::Data);
+        let task = ctx.task(task_id, TaskDataCategory::Data, TaskAccess::MaybeCreate);
         if let Some(value) = task.get_persistent_task_type() {
             value.to_string()
         } else if let Some(value) = task.get_transient_task_type() {
@@ -1789,7 +1823,7 @@ impl TurboTasksBackend {
         turbo_tasks: &TurboTasks<TurboTasksBackend>,
     ) {
         let mut ctx = self.execute_context(turbo_tasks);
-        let mut task = ctx.task(task_id, TaskDataCategory::All);
+        let mut task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MustExist);
         if let Some(in_progress) = task.take_in_progress() {
             match in_progress {
                 InProgressState::Scheduled {
@@ -1845,13 +1879,13 @@ impl TurboTasksBackend {
         let cause;
         {
             let mut ctx = self.execute_context(turbo_tasks);
-            let mut task = ctx.task(task_id, TaskDataCategory::All);
+            let mut task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
             task_type = task.get_task_type().to_owned();
             let once_task = matches!(task_type, TaskType::Transient(ref tt) if matches!(&**tt, TransientTask::Once(_)));
             if let Some(tasks) = task.prefetch() {
                 drop(task);
                 ctx.prepare_tasks(tasks, "prefetch");
-                task = ctx.task(task_id, TaskDataCategory::All);
+                task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
             }
             let in_progress = task.take_in_progress()?;
             let InProgressState::Scheduled { done_event, reason } = in_progress else {
@@ -2113,7 +2147,7 @@ impl TurboTasksBackend {
         #[cfg(feature = "verify_determinism")] stateful: bool,
         has_invalidator: bool,
     ) -> Result<TaskExecutionCompletePrepareResult, TaskPriority> {
-        let mut task = ctx.task(task_id, TaskDataCategory::All);
+        let mut task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MustExist);
         let is_recomputation = task.is_dirty().is_none();
         // Without dependency tracking, the SessionDependent dirty state is never read (no session
         // restore), so skip the work
@@ -2359,9 +2393,10 @@ impl TurboTasksBackend {
         // Check if the task can be marked as immutable
         let mut is_now_immutable = false;
         if let Some(dependencies) = task_dependencies_for_immutable
-            && dependencies
-                .iter()
-                .all(|&task_id| ctx.task(task_id, TaskDataCategory::Data).immutable())
+            && dependencies.iter().all(|&task_id| {
+                ctx.task(task_id, TaskDataCategory::Data, TaskAccess::MaybeCreate)
+                    .immutable()
+            })
         {
             is_now_immutable = true;
         }
@@ -2442,7 +2477,11 @@ impl TurboTasksBackend {
             )
             .entered();
             let mut make_stale = true;
-            let dependent = ctx.task(dependent_task_id, TaskDataCategory::All);
+            let dependent = ctx.task(
+                dependent_task_id,
+                TaskDataCategory::All,
+                TaskAccess::MaybeCreate,
+            );
             let transient_task_type = dependent.get_transient_task_type();
             if transient_task_type.is_some_and(|tt| matches!(&**tt, TransientTask::Once(_))) {
                 // once tasks are never invalidated
@@ -2557,7 +2596,7 @@ impl TurboTasksBackend {
     ) -> Option<TaskPriority> {
         debug_assert!(!new_children.is_empty());
 
-        let mut task = ctx.task(task_id, TaskDataCategory::All);
+        let mut task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
         let Some(in_progress) = task.get_in_progress() else {
             panic!("Task execution completed, but task is not in progress: {task:#?}");
         };
@@ -2633,7 +2672,7 @@ impl TurboTasksBackend {
             auto_hash_map::AutoMap<CellId, InProgressCellState, BuildHasherDefault<FxHasher>, 1>,
         >,
     ) {
-        let mut task = ctx.task(task_id, TaskDataCategory::All);
+        let mut task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
         let Some(in_progress) = task.take_in_progress() else {
             panic!("Task execution completed, but task is not in progress: {task:#?}");
         };
@@ -2735,7 +2774,7 @@ impl TurboTasksBackend {
         is_error: bool,
         is_recomputation: bool,
     ) -> Vec<SharedReference> {
-        let mut task = ctx.task(task_id, TaskDataCategory::All);
+        let mut task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
         let mut removed_cell_data = Vec::new();
         // An error is potentially caused by a eventual consistency, so we avoid updating cells
         // after an error as it is likely transient and we want to keep the dependent tasks
@@ -3056,7 +3095,7 @@ impl TurboTasksBackend {
         turbo_tasks: &TurboTasks<TurboTasksBackend>,
     ) -> Result<TypedCellContent> {
         let mut ctx = self.execute_context(turbo_tasks);
-        let task = ctx.task(task_id, TaskDataCategory::Data);
+        let task = ctx.task(task_id, TaskDataCategory::Data, TaskAccess::MaybeCreate);
         if let Some(content) = task.get_cell_data(&cell).cloned() {
             Ok(CellContent(Some(content)).into_typed(cell.type_id()))
         } else {
@@ -3074,7 +3113,7 @@ impl TurboTasksBackend {
         let mut ctx = self.execute_context(turbo_tasks);
         let mut collectibles = AutoMap::default();
         {
-            let mut task = ctx.task(task_id, TaskDataCategory::All);
+            let mut task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
             if task
                 .get_persistent_task_type()
                 .is_some_and(|t| !t.native_fn.is_root)
@@ -3115,7 +3154,7 @@ impl TurboTasksBackend {
             }
         }
         if let Some(reader_id) = reader_id {
-            let mut reader = ctx.task(reader_id, TaskDataCategory::Data);
+            let mut reader = ctx.task(reader_id, TaskDataCategory::Data, TaskAccess::MaybeCreate);
             let target = CollectiblesRef {
                 task: task_id,
                 collectible_type,
@@ -3205,7 +3244,7 @@ impl TurboTasksBackend {
 
     fn mark_own_task_as_finished(&self, task: TaskId, turbo_tasks: &TurboTasks<TurboTasksBackend>) {
         let mut ctx = self.execute_context(turbo_tasks);
-        let mut task = ctx.task(task, TaskDataCategory::Data);
+        let mut task = ctx.task(task, TaskDataCategory::Data, TaskAccess::MaybeCreate);
         if let Some(InProgressState::InProgress(box InProgressStateInner {
             marked_as_completed,
             ..
@@ -3245,7 +3284,7 @@ impl TurboTasksBackend {
         self.root_tasks.lock().remove(&task_id);
 
         let mut ctx = self.execute_context(turbo_tasks);
-        let mut task = ctx.task(task_id, TaskDataCategory::All);
+        let mut task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
         let is_dirty = task.is_dirty();
         let has_dirty_containers = task.has_dirty_containers();
         if is_dirty.is_some() || has_dirty_containers {
@@ -3293,7 +3332,7 @@ impl TurboTasksBackend {
                         aggregated_nodes.len()
                     );
                 }
-                let task = ctx.task(task_id, TaskDataCategory::All);
+                let task = ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
                 if idle && !self.is_idle.load(Ordering::Relaxed) {
                     return;
                 }
@@ -3356,7 +3395,8 @@ impl TurboTasksBackend {
 
                 if should_be_in_upper {
                     for upper_id in uppers {
-                        let upper = ctx.task(upper_id, TaskDataCategory::All);
+                        let upper =
+                            ctx.task(upper_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
                         let in_upper = upper
                             .get_aggregated_dirty_containers(&task_id)
                             .is_some_and(|&dirty| dirty > 0);
@@ -3371,7 +3411,7 @@ impl TurboTasksBackend {
                                 "Task {} ({}) is dirty, but is not listed in the upper task {} \
                                  ({})\nThese dirty containers are present:\n{:#?}",
                                 task_id,
-                                ctx.task(task_id, TaskDataCategory::Data)
+                                ctx.task(task_id, TaskDataCategory::Data, TaskAccess::MaybeCreate)
                                     .get_task_description(),
                                 upper_id,
                                 upper_task_desc,
@@ -3395,7 +3435,8 @@ impl TurboTasksBackend {
                             .iter()
                             .map(|t| format!(
                                 "{t} {}",
-                                ctx.task(*t, TaskDataCategory::Data).get_task_description()
+                                ctx.task(*t, TaskDataCategory::Data, TaskAccess::MaybeCreate)
+                                    .get_task_description()
                             ))
                             .collect::<Vec<_>>()
                     )
@@ -3403,7 +3444,8 @@ impl TurboTasksBackend {
 
                     let task_id = collectible.cell.task;
                     let mut queue = {
-                        let task = ctx.task(task_id, TaskDataCategory::All);
+                        let task =
+                            ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
                         get_uppers(&task)
                     };
                     let mut visited = FxHashSet::default();
@@ -3412,7 +3454,8 @@ impl TurboTasksBackend {
                         writeln!(stdout, "{task_id:?} -> {upper_id:?}").unwrap();
                     }
                     while let Some(task_id) = queue.pop() {
-                        let task = ctx.task(task_id, TaskDataCategory::All);
+                        let task =
+                            ctx.task(task_id, TaskDataCategory::All, TaskAccess::MaybeCreate);
                         let desc = task.get_task_description();
                         let aggregated_collectible = task
                             .get_aggregated_collectibles(&collectible)

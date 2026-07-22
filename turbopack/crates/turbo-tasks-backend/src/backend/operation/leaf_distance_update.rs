@@ -11,7 +11,7 @@ use turbo_tasks::TaskId;
 
 use crate::backend::{
     TaskDataCategory,
-    operation::{ExecuteContext, Operation},
+    operation::{ExecuteContext, Operation, TaskAccess},
     storage_schema::TaskStorageAccessors,
 };
 
@@ -142,6 +142,7 @@ impl LeafDistanceUpdateQueue {
             task_id,
             // For performance reasons this should stay `Data` and not `All`
             TaskDataCategory::Data,
+            TaskAccess::MaybeCreate,
         );
         debug_assert!(dependencies_max_distance_in_buffer < u32::MAX / 2);
         let mut leaf_distance = task.get_leaf_distance().copied().unwrap_or_default();
