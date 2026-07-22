@@ -278,12 +278,18 @@ function rewriteTurbopackSources(
     }
   } else {
     for (let i = 0; i < sourceMap.sources.length; i++) {
-      sourceMap.sources[i] = pathToFileURL(
-        join(
-          projectRoot,
-          sourceMap.sources[i].replace(/turbopack:\/\/\/\[project\]/, '')
-        )
-      ).toString()
+      // Only `[project]`-relative sources refer to files we can resolve
+      // against the project root. Other sources are already absolute
+      // (`file://`) or virtual (`turbopack:///[turbopack]/...`) and must be
+      // kept as-is.
+      if (sourceMap.sources[i].startsWith('turbopack:///[project]')) {
+        sourceMap.sources[i] = pathToFileURL(
+          join(
+            projectRoot,
+            sourceMap.sources[i].slice('turbopack:///[project]'.length)
+          )
+        ).toString()
+      }
     }
   }
 }
