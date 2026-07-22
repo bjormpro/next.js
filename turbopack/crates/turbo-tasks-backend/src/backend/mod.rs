@@ -1,6 +1,7 @@
 mod cell_data;
 mod counter_map;
 mod eviction;
+mod gc;
 mod operation;
 mod snapshot_coordinator;
 mod storage;
@@ -72,7 +73,7 @@ use crate::{
         storage::Storage,
         storage_schema::{TaskStorage, TaskStorageAccessors},
     },
-    backing_storage::{SnapshotItem, compute_task_type_hash},
+    backing_storage::{SnapshotItem, TaskDeletion, compute_task_type_hash},
     data::{
         ActivenessState, CellRef, CollectibleRef, CollectiblesRef, Dirtyness, InProgressCellState,
         InProgressState, InProgressStateInner, OutputValue, TransientTask,
@@ -213,6 +214,11 @@ pub struct TurboTasksBackend {
     /// `stop_and_wait`).
     snapshot_in_progress: Mutex<()>,
 
+    /// Whether the `parent_count` GC pass runs for this backend. Initialized from the
+    /// `TURBO_ENGINE_GC` env var and, in debug builds, forced off if the configuration would
+    /// strand soft-deleted tasks resident — see the constructor.
+    gc_enabled: bool,
+
     stopping: AtomicBool,
     stopping_event: Event,
     idle_start_event: Event,
@@ -247,8 +253,32 @@ impl TurboTasksBackend {
         let next_task_id = backing_storage
             .next_free_task_id()
             .expect("Failed to get task id");
+
+        // GC leaves collected tasks resident (soft-deleted) until a reclaim step removes them. The
+        // background `ReadWrite` loop reclaims them in `evict_after_snapshot`, so GC there REQUIRES
+        // eviction to be on; with eviction off, soft-deleted tasks would accumulate forever. The
+        // `ReadWriteOnShutdown` drain path drops the whole map wholesale (no per-cycle eviction
+        // needed), and `ReadOnly` never persists/GCs. In debug builds, refuse the unsafe combo by
+        // forcing GC off with a warning; release builds trust the caller's configuration.
+        // Opt-in via `TURBO_ENGINE_GC` until GC has been proven on trusted apps; the eventual
+        // default-on flip gets its own escape hatch.
+        let mut gc_enabled = std::env::var_os("TURBO_ENGINE_GC")
+            .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")));
+        if gc_enabled
+            && matches!(options.storage_mode, Some(StorageMode::ReadWrite))
+            && options.eviction_mode == EvictionMode::Off
+        {
+            eprintln!(
+                "warning: TURBO_ENGINE_GC is set but eviction is disabled on a ReadWrite backend; \
+                 GC would leave collected tasks resident forever. Forcing GC off. Enable eviction \
+                 ('auto'/'full') to use GC in this mode."
+            );
+            gc_enabled = false;
+        }
+
         Self {
             options,
+            gc_enabled,
             start_time: Instant::now(),
             persisted_task_id_factory: IdFactoryWithReuse::new(
                 next_task_id,
@@ -328,6 +358,30 @@ impl TurboTasksBackend {
         };
         let counts = self.storage.evict_after_snapshot(None);
         (had_new_data, counts)
+    }
+
+    /// The number of persistent (non-transient) tasks resident in the map. Test-only hook: this is
+    /// the metric GC affects (transient roots like `run_once` tasks are never collected).
+    #[doc(hidden)]
+    pub fn resident_persistent_task_count_for_testing(&self) -> usize {
+        self.storage.resident_persistent_task_count()
+    }
+
+    /// The persistent `parent_count` of a resident task (0 if absent or not resident). Test-only
+    /// hook for verifying incremental refcount maintenance.
+    #[doc(hidden)]
+    pub fn parent_count_for_testing(&self, task: TaskId) -> u32 {
+        self.storage
+            .with_task(task, |t| t.gc_parent_count())
+            .unwrap_or(0)
+    }
+
+    /// The transient `transient_ref_count` of a resident task (0 if absent or not resident).
+    #[doc(hidden)]
+    pub fn transient_ref_count_for_testing(&self, task: TaskId) -> u32 {
+        self.storage
+            .with_task(task, |t| t.gc_transient_ref_count())
+            .unwrap_or(0)
     }
 
     /// Opens `task` with [`TaskAccess::MustExist`] and drops the guard. Test-only hook to exercise
@@ -468,6 +522,8 @@ impl TurboTasksBackend {
             // Having a task_pair here is not optimal, but otherwise this would lead to a race
             // condition. See below.
             // TODO(sokra): solve that in a more performant way.
+            // `MustExist`: the read target and its reader must both be live tasks (`task_pair`
+            // debug-asserts neither is GC-deleted).
             let (task, reader) = ctx.task_pair(
                 task_id,
                 reader_id,
@@ -852,6 +908,8 @@ impl TurboTasksBackend {
             // Having a task_pair here is not optimal, but otherwise this would lead to a race
             // condition. See below.
             // TODO(sokra): solve that in a more performant way.
+            // `MustExist`: the read target and its reader must both be live tasks (`task_pair`
+            // debug-asserts neither is GC-deleted).
             let (task, reader) = ctx.task_pair(
                 task_id,
                 reader_id,
@@ -985,6 +1043,33 @@ impl TurboTasksBackend {
         // request bit, suspended_operations) assumes only one snapshot runs at
         // a time. Held for the entire snapshot lifecycle.
         let _snapshot_in_progress = self.snapshot_in_progress.lock();
+
+        // When GC is enabled, run the pass and transition to the snapshot **atomically**, without
+        // releasing operation exclusion in between: `begin_gc` drains all operations, `gc_collect`
+        // marks collectible tasks soft-deleted (cascading `parent_count` decrements to children),
+        // and `into_snapshot` swaps the GC request bit for the snapshot bit under one lock. Since
+        // no operation can run in between, a decremented task can't be resurrected before
+        // it is persisted, so the children counts and the snapshot stay consistent and the
+        // tombstones (derived from the `deleted` flag) ride this same commit. Without GC,
+        // begin the snapshot directly. Opt-in via `TURBO_ENGINE_GC`.
+        let mut snapshot_phase = if self.gc_enabled {
+            let gc_span = tracing::info_span!(
+                parent: parent_span.clone(),
+                "gc",
+                collected = tracing::field::Empty,
+                edges_deleted = tracing::field::Empty,
+            )
+            .entered();
+            let gc_phase = self.snapshot_coord.begin_gc();
+            let stats = self.gc_collect(turbo_tasks);
+            gc_span.record("collected", stats.collected);
+            gc_span.record("edges_deleted", stats.edges_deleted);
+            gc_phase.into_snapshot()
+        } else {
+            // `begin_snapshot` blocks until in-flight operations drain (spanned inside the
+            // coordinator).
+            self.snapshot_coord.begin_snapshot()
+        };
         let start = Instant::now();
         // SystemTime for wall-clock timestamps in trace events (milliseconds
         // since epoch). Instant is monotonic but has no defined epoch, so it
@@ -992,11 +1077,9 @@ impl TurboTasksBackend {
         let wall_start = SystemTime::now();
         debug_assert!(self.should_persist());
 
-        let mut snapshot_phase = {
-            let _span = tracing::info_span!("blocking").entered();
-            self.snapshot_coord.begin_snapshot()
-        };
-        // Enter snapshot mode, which atomically reads and resets the modified count.
+        // Enter snapshot mode, which atomically reads and resets the modified count. GC marks each
+        // collected task modified, so a pass that collected anything makes `has_modifications`
+        // true and the scan below runs and emits the tombstones.
         // Checking after start_snapshot ensures no concurrent increments can race.
         let (snapshot_guard, has_modifications) = self.storage.start_snapshot();
 
@@ -1216,6 +1299,31 @@ impl TurboTasksBackend {
                 unreachable!("transient task_ids should never be enqueued to be persisted");
             }
 
+            // A GC-soft-deleted task is not persisted; instead its on-disk copy (task meta/data +
+            // its `TaskCache` entry) is tombstoned in this same commit, riding the same streaming
+            // shard iterator `save_snapshot` consumes. GC marks such tasks modified so the scan
+            // visits them here, and the iterator clears their flags so a still-`deleted` task not
+            // hard-deleted this cycle isn't re-tombstoned next snapshot.
+            if inner.flags.deleted() {
+                // A task collected before it was ever persisted (`new_task`) has no on-disk copy —
+                // emit nothing (just let the scan clear its flags) rather than tombstone a
+                // key that was never written.
+                if inner.flags.new_task() {
+                    return SnapshotItem::Skip;
+                }
+                // Only persistent tasks are collected, so the persistent task type (the `TaskCache`
+                // key) is always present.
+                let task_type_hash = compute_task_type_hash(
+                    inner
+                        .get_persistent_task_type()
+                        .expect("a GC-deleted (non-transient) task must have a task type"),
+                );
+                return SnapshotItem::Delete(TaskDeletion {
+                    task_id,
+                    task_type_hash,
+                });
+            }
+
             let encode_meta = inner.flags.meta_modified();
             let encode_data = inner.flags.data_modified();
 
@@ -1287,6 +1395,8 @@ impl TurboTasksBackend {
         // Tasks were already consumed by take_snapshot, so a future snapshot
         // would not re-persist them — returning an error signals to the caller
         // that further persist attempts would corrupt the task graph in storage.
+        // GC tombstones are carried inline as `SnapshotItem::Delete` entries in `task_snapshots`
+        // (derived from the `deleted` flag during the scan) and applied in the same atomic commit.
         let snapshot_meta = self
             .backing_storage
             .save_snapshot(suspended_operations, task_snapshots)?;
@@ -1445,17 +1555,15 @@ impl TurboTasksBackend {
             self.is_idle.store(false, Ordering::Release);
             self.verify_aggregation_graph(turbo_tasks, false);
         }
-        // eagerly drop the task cache before persisting
+        // The task_cache is a pure perf cache backed by the DB and isn't read during the stop
+        // snapshot (no task creation runs concurrently with stop). Drop it before persisting to
+        // lower peak memory during the serialization/write.
         self.storage.drop_task_cache();
-        if self.should_persist() {
-            // The task_cache is a pure perf cache backed by the DB and isn't read during the
-            // stop snapshot (no task creation runs concurrently with stop). Drop it before
-            // persisting to lower peak memory during the serialization/write.
-            if let Err(err) =
+        if self.should_persist()
+            && let Err(err) =
                 self.snapshot_and_persist(Span::current().into(), SnapshotReason::Stop, turbo_tasks)
-            {
-                eprintln!("Persisting failed during shutdown: {err:?}");
-            }
+        {
+            eprintln!("Persisting failed during shutdown: {err:?}");
         }
         self.storage.drop_contents();
         if let Err(err) = self.backing_storage.shutdown() {
@@ -2092,10 +2200,6 @@ impl TurboTasksBackend {
         let has_new_children = !new_children.is_empty();
         span.record("new_children", new_children.len());
 
-        if has_new_children {
-            self.task_execution_completed_unfinished_children_dirty(&mut ctx, &new_children)
-        }
-
         if has_new_children
             && let Some(stale_priority) =
                 self.task_execution_completed_connect(&mut ctx, task_id, new_children)
@@ -2558,36 +2662,6 @@ impl TurboTasksBackend {
         }
     }
 
-    fn task_execution_completed_unfinished_children_dirty(
-        &self,
-        ctx: &mut impl ExecuteContext<'_>,
-        new_children: &FxHashSet<TaskId>,
-    ) {
-        debug_assert!(!new_children.is_empty());
-
-        let mut queue = AggregationUpdateQueue::new();
-        ctx.for_each_task_all(
-            new_children.iter().copied(),
-            "unfinished children dirty",
-            |child_task, ctx| {
-                if !child_task.has_output() {
-                    let child_id = child_task.id();
-                    make_task_dirty_internal(
-                        child_task,
-                        child_id,
-                        false,
-                        #[cfg(feature = "task_dirty_cause")]
-                        TaskDirtyCause::InitialDirty,
-                        &mut queue,
-                        ctx,
-                    );
-                }
-            },
-        );
-
-        queue.execute(ctx);
-    }
-
     fn task_execution_completed_connect(
         &self,
         ctx: &mut impl ExecuteContext<'_>,
@@ -2970,6 +3044,7 @@ impl TurboTasksBackend {
                         // grouped together in trace viewers.
                         let background_span =
                             tracing::info_span!(parent: None, "background snapshot");
+
                         match self.snapshot_and_persist(background_span.id(), reason, turbo_tasks) {
                             Err(err) => {
                                 // save_snapshot consumed persisted_task_cache_log entries;
@@ -3007,6 +3082,7 @@ impl TurboTasksBackend {
                                         }
                                     }};
                                 }
+
                                 // Evict persisted tasks from memory to reclaim space.
                                 // Like compaction, this runs after snapshot_and_persist
                                 // as a separate concern.
@@ -3742,6 +3818,14 @@ impl Backend for TurboTasksBackend {
 
     fn mark_own_task_as_finished(&self, task_id: TaskId, turbo_tasks: &TurboTasks<Self>) {
         self.mark_own_task_as_finished(task_id, turbo_tasks);
+    }
+
+    fn pin_task_for_gc(&self, task: TaskId, turbo_tasks: &TurboTasks<Self>) {
+        self.gc_pin(task, turbo_tasks);
+    }
+
+    fn unpin_task_for_gc(&self, task: TaskId, turbo_tasks: &TurboTasks<Self>) {
+        self.gc_unpin(task, turbo_tasks);
     }
 
     fn connect_task(

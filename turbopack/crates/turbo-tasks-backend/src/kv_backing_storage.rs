@@ -281,6 +281,9 @@ impl TurboBackingStorage {
                                 shard_deletes.push(deletion);
                                 continue;
                             }
+                            // A task collected before it was ever persisted: nothing on disk to
+                            // put or tombstone.
+                            SnapshotItem::Skip => continue,
                         };
                         let key = IntKey::new(*task_id);
                         let key = key.as_ref();
@@ -455,6 +458,10 @@ impl TurboBackingStorage {
         Ok(task_ids)
     }
 
+    /// Restores `category` for `task_id` into `storage`, returning whether the key was **present**
+    /// in the database. `Ok(false)` means the key is absent (nothing decoded, `storage` left
+    /// untouched) — callers that require the task to exist use this to distinguish a real (possibly
+    /// empty) on-disk task from one that was never persisted or has been tombstoned.
     pub(crate) fn lookup_data(
         &self,
         task_id: TaskId,

@@ -24,22 +24,22 @@ pub enum SnapshotItem {
         task_type_hash: Option<TaskTypeHash>,
     },
     /// Tombstone a GC-collected task (see [`TaskDeletion`]).
-    ///
-    /// Not yet constructed: this PR lands the persistence-side delete mechanism (the
-    /// `save_snapshot` handling below + its tests). The GC pass that emits `Delete` for
-    /// soft-deleted tasks lands in a later PR in the stack.
-    #[allow(dead_code)]
     Delete(TaskDeletion),
+    /// Nothing to persist for this task, but it still rode the modified scan (so its flags are
+    /// cleared). Emitted for a GC-collected task that was *never persisted* (`new_task`): there is
+    /// no on-disk copy to tombstone. `save_snapshot` ignores it.
+    Skip,
 }
 
 impl SnapshotItem {
-    /// The task this item persists or tombstones. (Currently only used by tests, which assert on
-    /// the id of items yielded by the snapshot iterator.)
+    /// The task this item persists or tombstones, if any. (Currently only used by tests, which
+    /// assert on the id of items yielded by the snapshot iterator.)
     #[cfg(test)]
-    pub fn task_id(&self) -> TaskId {
+    pub fn task_id(&self) -> Option<TaskId> {
         match self {
-            SnapshotItem::Put { task_id, .. } => *task_id,
-            SnapshotItem::Delete(TaskDeletion { task_id, .. }) => *task_id,
+            SnapshotItem::Put { task_id, .. } => Some(*task_id),
+            SnapshotItem::Delete(TaskDeletion { task_id, .. }) => Some(*task_id),
+            SnapshotItem::Skip => None,
         }
     }
 }
