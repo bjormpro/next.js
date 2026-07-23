@@ -16,7 +16,10 @@ import type {
   SyncMessage,
   TurbopackConnectedMessage,
 } from './hot-reloader-types'
-import { HMR_MESSAGE_SENT_TO_BROWSER } from './hot-reloader-types'
+import {
+  getHmrMessageQueueKey,
+  HMR_MESSAGE_SENT_TO_BROWSER,
+} from './hot-reloader-types'
 import type {
   Update as TurbopackUpdate,
   Endpoint,
@@ -767,11 +770,12 @@ export async function createHotReloaderTurbopack(
   const sendEnqueuedMessagesDebounce = debounce(sendEnqueuedMessages, 2)
 
   const sendHmr: SendHmr = (id: string, message: HmrMessageSentToBrowser) => {
+    const key = getHmrMessageQueueKey(id, message)
     for (const client of [
       ...clientsWithoutHtmlRequestId,
       ...clientsByHtmlRequestId.values(),
     ]) {
-      clientStates.get(client)?.messages.set(id, message)
+      clientStates.get(client)?.messages.set(key, message)
     }
 
     hmrEventHappened = true

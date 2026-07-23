@@ -120,6 +120,21 @@ export interface ServerComponentChangesMessage {
 }
 
 /**
+ * Queued HMR messages replace unsent ones with the same key. Most messages
+ * are keyed by the emitting entry, but SERVER_COMPONENT_CHANGES is app-wide:
+ * every affected route endpoint emits a copy and each copy makes a client
+ * refetch its page, so all copies coalesce into one delivery per send batch.
+ */
+export function getHmrMessageQueueKey(
+  entryKey: string,
+  message: HmrMessageSentToBrowser
+): string {
+  return message.type === HMR_MESSAGE_SENT_TO_BROWSER.SERVER_COMPONENT_CHANGES
+    ? HMR_MESSAGE_SENT_TO_BROWSER.SERVER_COMPONENT_CHANGES
+    : entryKey
+}
+
+/**
  * Sent in dev when a route's set of statically-known params changed, e.g.
  * because `generateStaticParams` was added, removed, or edited.
  */
