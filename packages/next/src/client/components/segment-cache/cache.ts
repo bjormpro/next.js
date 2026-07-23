@@ -252,9 +252,9 @@ type SegmentCacheEntryShared = {
   /**
    * True if a runtime prefetch would return more content for this segment
    * than the entry contains. The scheduler uses this to decide whether a
-   * fulfilled static entry is sufficient on its own for a segment that
+   * fulfilled static entry is sufficient on its own during a walk that
    * requires runtime completeness — a StaticShell entry during the Shell
-   * phase, a PPR entry for an allow-runtime segment during the Speculative
+   * phase, a PPR entry during a Partial Prefetching route's Speculative
    * phase — or whether it must fall back to a runtime request
    * (RuntimeShell / PPRRuntime).
    *
@@ -274,7 +274,7 @@ type SegmentCacheEntryShared = {
    * falsely `true` value merely costs a wasted runtime request. Entries
    * written from runtime responses are always `false` — they ARE runtime
    * data. Full-variant static (PPR) writes carry the derived value too —
-   * load-bearing for allow-runtime segments, whose Speculative-phase
+   * load-bearing for Partial Prefetching routes, whose Speculative-phase
    * sufficiency check consults it (see pingSegmentBundle in scheduler.ts).
    */
   needsRuntimeRequest: boolean
@@ -339,9 +339,9 @@ export type NonEmptySegmentCacheEntry = Exclude<
  */
 export type SegmentBundle = {
   // Null when the segment has prefetching disabled entirely
-  // (prefetch: 'force-disabled' / instant = false; allow-runtime segments
-  // have static data and occupy a real node). The bundle chain passes
-  // through it but no cache entry is created.
+  // (prefetch: 'force-disabled' / instant = false; Partial Prefetching
+  // segments have static data and occupy a real node). The bundle chain
+  // passes through it but no cache entry is created.
   tree: RouteTree | null
   entry: SegmentCacheEntry | null
   parent: SegmentBundle | null
@@ -2703,9 +2703,9 @@ function writeSegmentBundleResponse(
     const data = serverDataArray[dataIndex]
 
     // Null data means this segment has prefetching disabled
-    // (prefetch: 'force-disabled' — allow-runtime segments have static data,
-    // so the server emits a real slot for them). Skip it without creating a
-    // cache entry.
+    // (prefetch: 'force-disabled' — Partial Prefetching segments have static
+    // data, so the server emits a real slot for them). Skip it without
+    // creating a cache entry.
     if (data === null || node.tree === null) {
       // The server's and the client's prefetch-disabled hints normally agree,
       // so there shouldn't be a spawned entry for a segment the server
@@ -3728,11 +3728,26 @@ function fulfillEntrySpawnedByRuntimePrefetch(
       // provide more than what's already here.
       false
     )
-    if (fulfilledVaryPath !== null) {
+    // Re-key the entry at its canonical path. When `varyParams` produced a
+    // generalized path above, use that; otherwise fall back to the request's
+    // own keying (this is load-bearing for entries spawned as revalidations:
+    // without the re-key they'd stay in their Revalidation slot forever,
+    // invisible to canonical reads, and the partial entry that prompted the
+    // revalidation would keep serving navigations). Full responses are
+    // excluded, matching the varyParams re-key: they're spawned as canonical
+    // entries at their final path, and their vary tracking can't be trusted
+    // for re-keying (see the fulfilledVaryPath derivation above).
+    const canonicalVaryPath =
+      fulfilledVaryPath !== null
+        ? fulfilledVaryPath
+        : fetchStrategy !== FetchStrategy.Full
+          ? getSegmentVaryPathForRequest(fetchStrategy, tree)
+          : null
+    if (canonicalVaryPath !== null) {
       const isRevalidation = false
       setInCacheMap(
         segmentCacheMap,
-        fulfilledVaryPath,
+        canonicalVaryPath,
         fulfilledEntry,
         isRevalidation
       )

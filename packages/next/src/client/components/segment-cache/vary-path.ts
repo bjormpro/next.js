@@ -388,6 +388,46 @@ export function getFulfilledSegmentVaryPath(
   return clone as SegmentVaryPath
 }
 
+/**
+ * Whether this segment's App Shell variant is equivalent to its concrete
+ * variant — i.e. its concrete vary path contains no non-root param (path
+ * param or search param) value that the shell vary path would substitute
+ * with Fallback (see getShellSegmentVaryPath). When true, a shell-tier
+ * cache entry for the segment contains the content a concrete request
+ * would produce (modulo strategy tier), so the entry's per-variant signals
+ * — notably `needsRuntimeRequest` — are valid for concrete reads, too.
+ * When false, a shell entry found by a concrete read is a less-specific
+ * variant: a more specific fetch can still return the param-dependent
+ * content the shell omits, regardless of what the shell entry's own
+ * signals say.
+ *
+ * A page's vary path structurally always carries a search node, so an
+ * empty search string is treated as equivalent to the shell's Fallback:
+ * there are no search params for a more specific fetch to resolve. (For a
+ * page that reads `searchParams`, an empty-search concrete render still
+ * resolves the read to an empty object where the shell leaves a hole —
+ * that residual difference is filled by the navigation-time request, the
+ * same trade the shell itself makes.)
+ */
+export function isShellVariantEqualToConcrete(
+  varyPath: SegmentVaryPath
+): boolean {
+  let node: VaryPath | null = varyPath
+  while (node !== null) {
+    if (
+      node.id !== null &&
+      node.isRootParam !== true &&
+      node.value !== Fallback &&
+      // Empty search: nothing for a more specific variant to resolve.
+      !(node.id === '?' && node.value === '')
+    ) {
+      return false
+    }
+    node = node.parent
+  }
+  return true
+}
+
 export function getShellSegmentVaryPath(original: VaryPath): SegmentVaryPath {
   // Re-keys a segment's vary path to identify the "App Shell" entry for this
   // segment position — a reusable loading state that can be served for any
