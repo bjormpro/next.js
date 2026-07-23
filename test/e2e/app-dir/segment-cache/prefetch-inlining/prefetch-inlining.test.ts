@@ -537,17 +537,17 @@ describe('prefetch inlining', () => {
     )
   })
 
-  it('runtime prefetch: layout cannot inline into a runtime leaf', async () => {
-    // Root → small static layout → page with runtime prefetch. Root inlines
-    // into the layout (the layout accepts root's data). But the layout
-    // cannot inline into the runtime page — the page is a leaf with no
-    // static descendants, so there's no response to carry the layout's data.
-    // The layout remains outlined while root is inlined into it.
+  it('runtime prefetch: layout inlines into an allow-runtime leaf; bundle is fetched on prefetch={true} opt-in', async () => {
+    // Root → small static layout → page with runtime prefetch. The
+    // allow-runtime page has a static response — the parts of the page that
+    // don't depend on runtime data — so the build inlining pass can inline
+    // the static layout into the page's bundle. The whole chain collapses:
+    // root inlines into the layout, and the layout inlines into the page.
     const data = await fetchRouteTreePrefetch(next, '/test-runtime-bailout')
     expect(renderInliningTree(data.tree)).toMatchInlineSnapshot(`
      "
               ⇣  root
-     outlined ■  └── "test-runtime-bailout"
+              ⇣  └── "test-runtime-bailout"
       runtime ◻      └── "__PAGE__" (+metadata)
      "
     `)
@@ -560,22 +560,46 @@ describe('prefetch inlining', () => {
     })
     const act = createRouterAct(page!)
 
+    // Reveal a default (auto) link to the route. The route is non-eager
+    // (the page is allow-runtime), so by design the default prefetch covers
+    // only the App Shell, and the per-link speculative prefetch is skipped.
+    // The layout's data lives in the page's static bundle, which is not
+    // fetched here, so the layout content must not arrive in any
+    // prefetch response.
     await act(
       async () => {
         await browser
-          .elementByCss('input[data-link-accordion="/test-runtime-bailout"]')
+          .elementByCss(
+            'input[data-prefetch="auto"]' +
+              '[data-link-accordion="/test-runtime-bailout"]'
+          )
+          .click()
+      },
+      { includes: 'Static layout content', block: 'reject' }
+    )
+
+    // Reveal a prefetch={true} link to the same route. Opting in fetches the
+    // page's static bundle, which carries the inlined layout data — this is
+    // the point of partial prefetching: the layout content arrives only when
+    // the user opts in.
+    await act(
+      async () => {
+        await browser
+          .elementByCss(
+            'input[data-prefetch="true"]' +
+              '[data-link-accordion="/test-runtime-bailout"]'
+          )
           .click()
       },
       { includes: 'Static layout content' }
     )
 
-    // Navigate to the route. The static layout was prefetched (and is cached),
-    // but the runtime leaf page has no static descendants and is not
-    // speculatively prefetched under App Shells — it is fetched here, on
-    // navigation.
+    // Navigate to the route. The prefetch={true} opt-in fetched everything —
+    // the static bundle (with the inlined layout) and the runtime prefetch —
+    // so the navigation is served entirely from the cache.
     await act(async () => {
       await browser.elementByCss('a[href="/test-runtime-bailout"]').click()
-    })
+    }, 'no-requests')
 
     expect(await browser.elementByCss('#layout-runtime-bailout').text()).toBe(
       'Static layout content'
@@ -598,9 +622,9 @@ describe('prefetch inlining', () => {
     expect(renderInliningTree(data.tree)).toMatchInlineSnapshot(`
      "
               ⇣  root
-      runtime ◻  └── "test-runtime-passthrough" (+metadata)
+      runtime ◻  └── "test-runtime-passthrough"
               ⇣      └── "inner"
-     outlined ■          └── "__PAGE__"
+     outlined ■          └── "__PAGE__" (+metadata)
      "
     `)
 
@@ -696,9 +720,9 @@ describe('prefetch inlining', () => {
     expect(renderInliningTree(data.tree)).toMatchInlineSnapshot(`
      "
               ⇣  root
-      runtime ◻  └── "test-runtime-parallel" (+metadata)
+      runtime ◻  └── "test-runtime-parallel"
               ⇣      ├── "inner"
-     outlined ■      │   └── "__PAGE__"
+     outlined ■      │   └── "__PAGE__" (+metadata)
      outlined ■      └── @sidebar/"__DEFAULT__"
      "
     `)
@@ -757,9 +781,9 @@ describe('prefetch inlining', () => {
     expect(renderInliningTree(data.tree)).toMatchInlineSnapshot(`
      "
               ⇣  root
-      runtime ◻  └── "test-independent-head" (+metadata)
+      runtime ◻  └── "test-independent-head"
               ⇣      └── "item"
-     outlined ■          └── "__PAGE__"
+     outlined ■          └── "__PAGE__" (+metadata)
      "
     `)
 

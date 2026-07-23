@@ -214,6 +214,18 @@ const enum PrefetchTaskExitStatus {
    * There's nothing left to prefetch.
    */
   Done,
+
+  /**
+   * Like Done, but a fulfilled static entry in the finished subtree reported
+   * that a runtime request would return more content than the entry contains
+   * (see needsRuntimeRequest in pingSegmentBundle). Internal to the static
+   * subtree walk: it bubbles up to the nearest enclosing decision point in
+   * pingNewPartOfCacheComponentsTree, which consumes it — or is dropped at
+   * the shared/new boundary in pingSharedPartOfCacheComponentsTree, where
+   * there's no decision point above to act on it. The walk functions'
+   * return types ensure it never escapes to the task level.
+   */
+  DoneNeedsRuntimeRequest,
 }
 
 /**
@@ -702,7 +714,13 @@ function background(task: PrefetchTask): boolean {
   return false
 }
 
-function pingRoute(now: number, task: PrefetchTask): PrefetchTaskExitStatus {
+function pingRoute(
+  now: number,
+  task: PrefetchTask
+):
+  | PrefetchTaskExitStatus.InProgress
+  | PrefetchTaskExitStatus.Blocked
+  | PrefetchTaskExitStatus.Done {
   const key = task.key
   const route = readOrCreateRouteCacheEntry(now, task, key)
   const exitStatus = pingRootRouteTree(now, task, route)
@@ -763,7 +781,10 @@ function pingRootRouteTree(
   now: number,
   task: PrefetchTask,
   route: RouteCacheEntry
-): PrefetchTaskExitStatus {
+):
+  | PrefetchTaskExitStatus.InProgress
+  | PrefetchTaskExitStatus.Blocked
+  | PrefetchTaskExitStatus.Done {
   switch (route.status) {
     case EntryStatus.Empty: {
       // Route is not yet cached, and there's no request already in progress.
@@ -860,26 +881,40 @@ function pingRootRouteTree(
           // Then, if there are any segments that need a runtime request,
           // do another pass to perform a runtime prefetch.
 
+          // Derive the static walk's parameters once per pass; the walk
+          // functions below receive them as arguments and are phase-agnostic.
+          // During the Shell phase the walk targets the App Shell variant of
+          // each segment (keyed at the shell vary paths); otherwise it's the
+          // ordinary per-segment static strategy. This is the only place the
+          // phase is consulted — everything below keys off the strategy.
+          const staticWalkStrategy =
+            task.phase === PrefetchPhase.Shell
+              ? FetchStrategy.StaticShell
+              : FetchStrategy.PPR
+
           if (
-            task.phase === PrefetchPhase.Speculative &&
+            staticWalkStrategy === FetchStrategy.PPR &&
             !subtreeHasSpeculativePrefetch(
               task.fetchStrategy,
               tree.prefetchHints
             )
           ) {
             // Nothing in the target route needs to be speculatively prefetched.
-            // Bail out.
+            // Bail out. (A PPR walk is the Speculative pass; same check as
+            // the per-subtree bail in pingNewPartOfCacheComponentsTree.)
             return PrefetchTaskExitStatus.Done
           }
 
-          pingStaticHead(now, task, route)
+          pingStaticHead(now, task, route, staticWalkStrategy)
+
           const exitStatus = pingSharedPartOfCacheComponentsTree(
             now,
             task,
             route,
             task.treeAtTimeOfPrefetch,
             tree,
-            null
+            null,
+            staticWalkStrategy
           )
           if (exitStatus === PrefetchTaskExitStatus.InProgress) {
             // Child yielded without finishing.
@@ -893,32 +928,27 @@ function pingRootRouteTree(
             // Do any segments have runtime prefetching configured? This is
             // sent by the server as part of the prefetch hints.
             tree.prefetchHints & PrefetchHint.SubtreeHasRuntimePrefetch ||
-            // Are we in the Shell prefetching phase? The Shell phase is
-            // allowed to perform runtime prefetches even without an explicit
-            // opt-in because the Shell for a given route is reusable across
-            // all given params, by definition. So it does not lead to an
+            // Is this an App Shell walk? The Shell phase is allowed to
+            // perform runtime prefetches even without an explicit opt-in
+            // because the Shell for a given route is reusable across all
+            // given params, by definition. So it does not lead to an
             // explosion in prefetching costs.
-            // TODO: The server now emits signals for skipping unnecessary
-            // runtime prefetch requests: an advisory
-            // PrefetchHint.ShouldAttemptStaticPrefetch bit on the route
-            // tree, and a load-bearing response-level `needsRuntimeRequest`
-            // promise on the static segment responses (fulfilled `true`
-            // visible in the decode means a runtime request would return
-            // more; rewindable at the shell boundary; combined with each
-            // segment's `isPartial`). They aren't consumed yet; wiring them
-            // up is left for a follow-up.
-            task.phase === PrefetchPhase.Shell
+            //
+            // Which segments actually need a runtime request — registered
+            // directly, or only as the fallback after an insufficient
+            // static attempt — was decided during the traversal above; see
+            // the decision point in pingNewPartOfCacheComponentsTree.
+            staticWalkStrategy === FetchStrategy.StaticShell
           ) {
             const runtimeStrategy =
-              task.phase === PrefetchPhase.Shell
+              staticWalkStrategy === FetchStrategy.StaticShell
                 ? FetchStrategy.RuntimeShell
                 : FetchStrategy.PPRRuntime
 
             // spawnedRuntimePrefetches was populated during the traversal
-            // above: every segment in the new part of the tree that is a
-            // candidate for runtime prefetching. It's derived purely from
-            // server hints, not cache state — it tells us whether a runtime
-            // request would be needed even if the cache were completely empty.
+            // above: every subtree in the new part of the tree that needs a
+            // runtime prefetch — plus, during the Shell phase, the head, if
+            // its static attempt was insufficient (see above).
             //
             // If it's null, nothing in the new part of the tree is a candidate
             // for runtime prefetching, and we don't fetch the head, either —
@@ -1011,25 +1041,56 @@ function pingRootRouteTree(
   return PrefetchTaskExitStatus.Done
 }
 
+/**
+ * Prefetches the Head data for a page (metadata, viewport). The Head is not
+ * really a route segment, in the sense that it doesn't appear in the route
+ * tree, but we store it in the cache as if it were, using a special key.
+ *
+ * Symmetric with the per-segment decision point in
+ * pingNewPartOfCacheComponentsTree: the head deopts to the runtime prefetch
+ * path either when it requires runtime completeness and no static attempt is
+ * happening, or when a fulfilled static head entry reported that a runtime
+ * request would return more content than the entry contains. Deopting
+ * registers the head under its metadata request key, which makes the runtime
+ * gate in pingRootRouteTree fire even when every tree segment was
+ * sufficient; pingRuntimeHead performs the actual head work.
+ */
 function pingStaticHead(
   now: number,
   task: PrefetchTask,
-  route: FulfilledRouteCacheEntry
+  route: FulfilledRouteCacheEntry,
+  // The per-pass static walk strategy; see pingRootRouteTree where
+  // it's derived.
+  fetchStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell
 ): void {
-  // The Head data for a page (metadata, viewport) is not really a route
-  // segment, in the sense that it doesn't appear in the route tree. But we
-  // store it in the cache as if it were, using a special key.
+  // The metadata pseudo-tree carries no prefetch hints, so this reduces to
+  // "the head is part of the App Shell": during an App Shell walk the head
+  // needs a response at least as complete as a runtime one, like every
+  // other shell segment.
+  const headRequiresRuntimeCompleteness = requiresRuntimeCompleteness(
+    fetchStrategy,
+    route.metadata.prefetchHints
+  )
   if (
-    // TODO: Currently static App Shell extraction is not implemented for
-    // per-segment prefetch responses. Instead, shell prefetches are only
-    // supported via a runtime prefetch request. The head will be prefetched
-    // as part of that request, so it's fine that we skip it here.
-    task.phase === PrefetchPhase.Shell ||
+    headRequiresRuntimeCompleteness &&
+    // The head is not a tree node — it hangs off the route root — so the
+    // static-attempt hint is read from the root's node. (Segments read the
+    // bit from their own node; see the decision point in
+    // pingNewPartOfCacheComponentsTree.)
+    (route.tree.prefetchHints & PrefetchHint.ShouldAttemptStaticPrefetch) === 0
+  ) {
+    // No static attempt: the head arrives via the runtime request instead.
+    addSpawnedRuntimePrefetch(task, route.metadata.requestKey)
+    return
+  }
+
+  if (
     // If the head was inlined into a page's bundle (HeadOutlined is NOT set
     // on the root), skip the standalone fetch — the head data will arrive
-    // as part of that page's response.
-    (process.env.__NEXT_PREFETCH_INLINING &&
-      !(route.tree.prefetchHints & PrefetchHint.HeadOutlined))
+    // as part of that page's response, and its runtime-completeness signal
+    // is carried by that page's own entries.
+    process.env.__NEXT_PREFETCH_INLINING &&
+    !(route.tree.prefetchHints & PrefetchHint.HeadOutlined)
   ) {
     return
   }
@@ -1038,13 +1099,67 @@ function pingStaticHead(
     tree: route.metadata,
     entry: readOrCreateSegmentCacheEntry(
       now,
-      FetchStrategy.PPR,
+      fetchStrategy,
       route.metadata,
       task._navigationLockPrefetch ?? null
     ),
     parent: null,
   }
-  pingSegmentBundle(now, task, route, task.key, route.metadata, segments)
+  const needsRuntimeRequest = pingSegmentBundle(
+    now,
+    task,
+    route,
+    task.key,
+    route.metadata,
+    segments,
+    fetchStrategy
+  )
+  if (headRequiresRuntimeCompleteness && needsRuntimeRequest) {
+    // The static attempt was insufficient for the head. Deopt to a
+    // runtime prefetch. (Outside of runtime-completeness contexts the
+    // head's signal is unused — a partial static head is filled in by the
+    // navigation-time request, as with any other static segment.)
+    addSpawnedRuntimePrefetch(task, route.metadata.requestKey)
+  }
+}
+
+/**
+ * Whether the task needs a cache entry at least as complete as a runtime
+ * response for the given segment before the segment counts as prefetched.
+ * Two cases, unified under one predicate:
+ *
+ * - Every segment during an App Shell (StaticShell) walk. The Shell phase
+ *   behaves as if allow-runtime were implied on every segment, because the
+ *   App Shell must be reusable across all params by definition.
+ * - A segment with runtime prefetching enabled (prefetch: 'allow-runtime',
+ *   the only config that sets HasRuntimePrefetch), in any phase.
+ *
+ * Requiring runtime completeness does not itself mean a runtime request is
+ * issued; see the decision point in pingNewPartOfCacheComponentsTree.
+ */
+function requiresRuntimeCompleteness(
+  staticWalkStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell,
+  treePrefetchHints: number
+): boolean {
+  return (
+    staticWalkStrategy === FetchStrategy.StaticShell ||
+    (treePrefetchHints & PrefetchHint.HasRuntimePrefetch) !== 0
+  )
+}
+
+/**
+ * Register a subtree root (or the head's metadata key) for the batched
+ * runtime request issued by the gate at the end of pingRootRouteTree.
+ */
+function addSpawnedRuntimePrefetch(
+  task: PrefetchTask,
+  requestKey: SegmentRequestKey
+): void {
+  if (task.spawnedRuntimePrefetches === null) {
+    task.spawnedRuntimePrefetches = new Set([requestKey])
+  } else {
+    task.spawnedRuntimePrefetches.add(requestKey)
+  }
 }
 
 function pingRuntimeHead(
@@ -1081,8 +1196,11 @@ function pingSharedPartOfCacheComponentsTree(
   route: FulfilledRouteCacheEntry,
   oldTree: FlightRouterState,
   newTree: RouteTree,
-  parentBundle: SegmentBundle | null
-): PrefetchTaskExitStatus {
+  parentBundle: SegmentBundle | null,
+  // The per-pass static walk strategy; see pingRootRouteTree where
+  // it's derived.
+  fetchStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell
+): PrefetchTaskExitStatus.InProgress | PrefetchTaskExitStatus.Done {
   // When Cache Components is enabled (or PPR, or a fully static route when PPR
   // is disabled; those cases are treated equivalently to Cache Components), we
   // start by prefetching each segment individually. Once we reach the "new"
@@ -1094,13 +1212,20 @@ function pingSharedPartOfCacheComponentsTree(
   // "new" part of the tree, we switch to a different traversal,
   // pingNewPartOfCacheComponentsTree.
 
+  // The shared part of the tree always performs the ordinary static (PPR)
+  // prefetch, regardless of phase. Phase-specific strategies — the runtime
+  // shell request and the Shell phase's StaticShell walk — apply only to the
+  // new part of the tree, so the per-pass walk strategy is irrelevant here.
+  // (The needs-runtime signal is dropped: there's no decision point above
+  // the shared part to act on it.)
   const bundleInProgress = accumulateSegmentBundle(
     now,
     task,
     route,
     newTree,
-    parentBundle
-  )
+    parentBundle,
+    FetchStrategy.PPR
+  ).bundle
 
   // Recursively ping the children.
   const oldTreeChildren = oldTree[1]
@@ -1141,18 +1266,43 @@ function pingSharedPartOfCacheComponentsTree(
           route,
           oldTreeChild,
           newTreeChild,
-          bundleForChild
+          bundleForChild,
+          fetchStrategy
         )
       } else {
         // We've entered the "new" part of the tree. Switch
         // traversal functions.
-        childExitStatus = pingNewPartOfCacheComponentsTree(
+        //
+        // Bundle chains must not cross the strategy boundary: the shared
+        // part walks at PPR while a Shell-phase new part walks at
+        // StaticShell, and a chain spanning both would fulfill the shared
+        // parent's concrete-path entry with shell-variant data. Nor may we
+        // finish the chain by fetching the new-part child at PPR here —
+        // that would prefetch new-part segments at the concrete tier
+        // during the Shell phase, which only the Speculative phase is
+        // allowed to do. So drop the bundle instead, exactly like the
+        // Speculative walk's subtree bail does when a chain crosses into a
+        // subtree it skips: nothing in a dropped chain was upgraded to
+        // Pending, so no entry is stranded, and the inlined shared data is
+        // fetched by the Speculative pass whenever its walk of the new
+        // part permits the child fetch.
+        const bundleForNewPart =
+          fetchStrategy === FetchStrategy.StaticShell ? null : bundleForChild
+        const childResult = pingNewPartOfCacheComponentsTree(
           now,
           task,
           route,
           newTreeChild,
-          bundleForChild
+          bundleForNewPart,
+          fetchStrategy
         )
+        // Consume any needs-runtime signal at this boundary: it was already
+        // handled by a decision point inside the new part of the tree, or
+        // there's no decision point above the shared part to act on it.
+        childExitStatus =
+          childResult === PrefetchTaskExitStatus.InProgress
+            ? PrefetchTaskExitStatus.InProgress
+            : PrefetchTaskExitStatus.Done
       }
       if (childExitStatus === PrefetchTaskExitStatus.InProgress) {
         // Child yielded without finishing.
@@ -1169,32 +1319,45 @@ function pingNewPartOfCacheComponentsTree(
   task: PrefetchTask,
   route: FulfilledRouteCacheEntry,
   tree: RouteTree,
-  parentBundle: SegmentBundle | null
-): PrefetchTaskExitStatus.InProgress | PrefetchTaskExitStatus.Done {
-  // We're now prefetching in the "new" part of the tree, the part that doesn't
-  // exist on the current page. (In other words, we're deeper than the
-  // shared layouts.) Segments in here default to being prefetched statically.
-  // However, if the server instructs us to, we may switch to a runtime
-  // prefetch instead. Traverse the tree and check at each segment.
+  parentBundle: SegmentBundle | null,
+  // The per-pass static walk strategy; see pingRootRouteTree where
+  // it's derived.
+  fetchStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell
+):
+  | PrefetchTaskExitStatus.InProgress
+  | PrefetchTaskExitStatus.Done
+  | PrefetchTaskExitStatus.DoneNeedsRuntimeRequest {
+  // We're now prefetching in the "new" part of the tree, the part that
+  // doesn't exist on the current page. (In other words, we're deeper than
+  // the shared layouts.) Segments in here default to being prefetched
+  // statically, at the per-pass strategy derived in pingRootRouteTree.
   //
-  // In the Shell phase, every new segment is treated as a runtime-prefetch
-  // boundary regardless of `HasRuntimePrefetch`, because the Shell is
-  // reusable across all params by definition (see the matching comment in
-  // the main scheduler loop).
+  // This function is also the decision point for segments that require
+  // runtime completeness — an entry at least as complete as a runtime
+  // response — before the prefetch can complete (see
+  // requiresRuntimeCompleteness). If the segment's node carries the
+  // ShouldAttemptStaticPrefetch hint (the build-time prerender accessed no
+  // runtime data), its subtree is prefetched statically first,
+  // and the responses themselves decide whether that was enough: every
+  // fulfilled entry carries a needsRuntimeRequest signal. Pending responses
+  // block the task, so the attempt is serial, never raced: static attempt →
+  // observe → runtime only if needed. Without the hint, the segment deopts
+  // directly. Deopting registers the segment's request key in
+  // spawnedRuntimePrefetches; the runtime gate at the end of
+  // pingRootRouteTree issues a single batched runtime request for
+  // everything that accumulated, and that request re-fetches the whole
+  // subtree, so the walk stops descending at a deopt.
   //
-  // TODO: If we're reasonably confident that the shell does not depend on
-  // session data (cookies), we should attempt to prefetch the shell
-  // statically, instead of via a runtime prefetch. This is an optimization to skip a
-  // runtime shell request. For fully static pages, it doesn't matter since
-  // server will respond to even a runtime request with a static response. For
-  // a partially static page, we can send down a hint from the server.
-  // The server-side hints for this now exist
-  // (PrefetchHint.ShouldAttemptStaticPrefetch on the route tree, the
-  // `needsRuntimeRequest` promise + per-segment `isPartial` on static
-  // segment responses) but aren't consumed yet.
+  // Descendants that don't themselves require runtime completeness bubble
+  // the signal up to this decision point instead of acting on it: outside
+  // an attempt the same signal is routine — any partial entry of a page
+  // that accesses runtime data carries it.
 
   if (
-    task.phase === PrefetchPhase.Speculative &&
+    // Only the Speculative pass skips subtrees with nothing to speculatively
+    // prefetch. (It's also the only pass that walks at FetchStrategy.PPR;
+    // the Shell phase walks at StaticShell and covers the whole new tree.)
+    fetchStrategy === FetchStrategy.PPR &&
     !subtreeHasSpeculativePrefetch(task.fetchStrategy, tree.prefetchHints)
   ) {
     // Nothing in the new part of the tree needs to be speculatively prefetched.
@@ -1202,30 +1365,68 @@ function pingNewPartOfCacheComponentsTree(
     return PrefetchTaskExitStatus.Done
   }
 
-  if (
-    tree.prefetchHints & PrefetchHint.HasRuntimePrefetch ||
-    task.phase === PrefetchPhase.Shell
-  ) {
-    if (task.spawnedRuntimePrefetches === null) {
-      task.spawnedRuntimePrefetches = new Set([tree.requestKey])
-    } else {
-      task.spawnedRuntimePrefetches.add(tree.requestKey)
-    }
+  const segmentRequiresRuntimeCompleteness = requiresRuntimeCompleteness(
+    fetchStrategy,
+    tree.prefetchHints
+  )
+  // TODO: The static-attempt hint reflects the build-time prerender's whole
+  // runtime-data tracking, so a page that always accesses
+  // runtime data after the shell stage never attempts a static prefetch —
+  // even though its shell variant is rewindable at the shell boundary and
+  // perfectly reusable. The server could emit a second bit derived from the
+  // shell-stage value ("a static SHELL attempt is worthwhile even though
+  // the page accesses runtime data post-shell") to let such pages attempt
+  // static, too.
+  // A force-disabled segment deliberately does NOT deopt here: disabling
+  // prefetch is passive. It never initiates a request — its accumulation
+  // below contributes nothing — and must never be the reason a runtime
+  // prefetch spawns, though it may ride along in a runtime response issued
+  // on another segment's behalf.
+  const attemptStaticPrefetchOfSegment =
+    (tree.prefetchHints & PrefetchHint.ShouldAttemptStaticPrefetch) !== 0
+
+  if (segmentRequiresRuntimeCompleteness && !attemptStaticPrefetchOfSegment) {
+    // Deopt directly to a runtime prefetch, without a static attempt.
+    addSpawnedRuntimePrefetch(task, tree.requestKey)
     // If there's a pending static bundle from a parent, we need to finish
     // prefetching it before bailing out to runtime prefetching.
     if (parentBundle !== null) {
-      finishStaticBundleOnRuntimeBailout(now, task, route, tree, parentBundle)
+      finishStaticBundleOnRuntimeBailout(
+        now,
+        task,
+        route,
+        tree,
+        parentBundle,
+        fetchStrategy
+      )
     }
     return PrefetchTaskExitStatus.Done
   }
 
-  const bundleInProgress = accumulateSegmentBundle(
+  // Prefetch this segment and its subtree statically, using the normal
+  // static bundling walk.
+  const accumulation = accumulateSegmentBundle(
     now,
     task,
     route,
     tree,
-    parentBundle
+    parentBundle,
+    fetchStrategy
   )
+  const bundleInProgress = accumulation.bundle
+  let needsRuntimeRequest = accumulation.needsRuntimeRequest
+
+  if (segmentRequiresRuntimeCompleteness && needsRuntimeRequest) {
+    // The static attempt for this segment was insufficient. Stop the walk
+    // and deopt — the runtime prefetch covers the whole subtree. (Unlike the
+    // direct deopt above, any open bundle is dropped rather than finished: a
+    // fulfilled InlinedIntoChild node can report a true signal while its
+    // chain is still open. That's safe — nothing in an un-pinged chain was
+    // upgraded to Pending, so no entry is stranded blocking the task, and
+    // Empty entries in the dropped chain are re-fetched by a later pass.)
+    addSpawnedRuntimePrefetch(task, tree.requestKey)
+    return PrefetchTaskExitStatus.Done
+  }
 
   if (tree.slots !== null) {
     if (!hasNetworkBandwidth(task)) {
@@ -1243,20 +1444,39 @@ function pingNewPartOfCacheComponentsTree(
         childTree.prefetchHints & PrefetchHint.ParentInlinedIntoSelf
           ? bundleInProgress
           : null
-      const childExitStatus = pingNewPartOfCacheComponentsTree(
+      const childResult = pingNewPartOfCacheComponentsTree(
         now,
         task,
         route,
         childTree,
-        bundleForChild
+        bundleForChild,
+        fetchStrategy
       )
-      if (childExitStatus === PrefetchTaskExitStatus.InProgress) {
+      if (childResult === PrefetchTaskExitStatus.InProgress) {
         // Child yielded without finishing.
         return PrefetchTaskExitStatus.InProgress
       }
+      if (childResult === PrefetchTaskExitStatus.DoneNeedsRuntimeRequest) {
+        needsRuntimeRequest = true
+      }
     }
   }
-  // This segment and all its children have finished prefetching.
+
+  if (!segmentRequiresRuntimeCompleteness) {
+    // This segment and all its children have finished prefetching. Bubble
+    // the needs-runtime signal to the nearest enclosing decision point.
+    return needsRuntimeRequest
+      ? PrefetchTaskExitStatus.DoneNeedsRuntimeRequest
+      : PrefetchTaskExitStatus.Done
+  }
+  if (needsRuntimeRequest) {
+    // A descendant bubbled up an insufficient static entry (this segment's
+    // own was checked before the walk). Deopt to a runtime prefetch.
+    addSpawnedRuntimePrefetch(task, tree.requestKey)
+  }
+  // Otherwise, the static attempt was sufficient for this subtree — or parts
+  // of it are still in flight, in which case the task is blocked and the
+  // decision re-runs against the received responses.
   return PrefetchTaskExitStatus.Done
 }
 
@@ -1803,6 +2023,13 @@ function pingRuntimePrefetches(
 /**
  * Walk a SegmentBundle, apply status-based logic to each entry, and if any
  * entries need data, spawn a single fetch request for the whole bundle.
+ *
+ * Returns true if a fulfilled entry in the bundle reported that a runtime
+ * request would return more content than the entry contains
+ * (needsRuntimeRequest, derived at write time from the response that
+ * produced the entry). The callers bubble this signal up to the decision
+ * point in pingNewPartOfCacheComponentsTree, which uses it during a static
+ * attempt to decide whether to fall back to a runtime prefetch.
  */
 function pingSegmentBundle(
   now: number,
@@ -1810,10 +2037,13 @@ function pingSegmentBundle(
   route: FulfilledRouteCacheEntry,
   routeKey: RouteCacheKey,
   tree: RouteTree,
-  segments: SegmentBundle
-): void {
+  segments: SegmentBundle,
+  // Per-pass static walk strategy; see pingRootRouteTree where it's derived.
+  fetchStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell
+): boolean {
   let segmentCount = 0
   let needsFetch = false
+  let needsRuntimeRequest = false
   let node: SegmentBundle | null = segments
   while (node !== null) {
     segmentCount++
@@ -1827,7 +2057,7 @@ function pingSegmentBundle(
       case EntryStatus.Empty:
         upgradeToPendingSegment(
           nodeEntry,
-          FetchStrategy.PPR,
+          fetchStrategy,
           task._navigationLockPrefetch ?? null
         )
         needsFetch = true
@@ -1837,20 +2067,24 @@ function pingSegmentBundle(
         break
       case EntryStatus.Pending:
         if (
+          // During a static shell attempt, never spawn revalidations — just
+          // wait for the in-flight response (blocked below); its sufficiency
+          // is checked on the re-run pass.
+          fetchStrategy === FetchStrategy.PPR &&
           canNewFetchStrategyProvideMoreContent(
             nodeEntry.fetchStrategy,
-            FetchStrategy.PPR
+            fetchStrategy
           )
         ) {
           const revalidatingEntry = readOrCreateRevalidatingSegmentEntry(
             now,
-            FetchStrategy.PPR,
+            fetchStrategy,
             nodeTree
           )
           if (revalidatingEntry.status === EntryStatus.Empty) {
             upgradeToPendingSegment(
               revalidatingEntry,
-              FetchStrategy.PPR,
+              fetchStrategy,
               task._navigationLockPrefetch ?? null
             )
             node.entry = revalidatingEntry
@@ -1868,20 +2102,30 @@ function pingSegmentBundle(
         break
       case EntryStatus.Rejected:
         if (
+          // During a static shell attempt, a rejected entry is skipped
+          // outright: no retry revalidation, and — deliberately — no runtime
+          // fallback either (per-segment rejection semantics; the entry's
+          // staleAt governs when it may be retried). Note that the cache
+          // path encodes "no shell exists" (a static response whose shell
+          // byte offset is 0, i.e. the page wasn't produced by staged
+          // rendering) as a rejection too, so such segments get no shell
+          // prefetch at all — an edge that shouldn't occur for hint-set
+          // Cache Components routes.
+          fetchStrategy === FetchStrategy.PPR &&
           canNewFetchStrategyProvideMoreContent(
             nodeEntry.fetchStrategy,
-            FetchStrategy.PPR
+            fetchStrategy
           )
         ) {
           const revalidatingEntry = readOrCreateRevalidatingSegmentEntry(
             now,
-            FetchStrategy.PPR,
+            fetchStrategy,
             nodeTree
           )
           if (revalidatingEntry.status === EntryStatus.Empty) {
             upgradeToPendingSegment(
               revalidatingEntry,
-              FetchStrategy.PPR,
+              fetchStrategy,
               task._navigationLockPrefetch ?? null
             )
             node.entry = revalidatingEntry
@@ -1906,11 +2150,29 @@ function pingSegmentBundle(
         // entry itself — nothing ever pings a Rejected entry.
         break
       case EntryStatus.Fulfilled: {
+        if (nodeEntry.needsRuntimeRequest) {
+          // A runtime request would return more content for this segment
+          // than the entry contains. Surface it via the return value.
+          needsRuntimeRequest = true
+        }
+
         // For shell entries (less specific than PPR), upgrade during the
         // Speculative phase itself — no background deferral, since the
         // whole point of the Speculative phase is to bring the cache up
         // to the per-link-concrete tier. `isPartial` ensures a complete
         // entry isn't re-fetched.
+        //
+        // Exception: for a segment with runtime prefetching enabled
+        // (prefetch: 'allow-runtime'), an entry that's already
+        // runtime-complete by its own signal is not upgraded, even when
+        // it's partial and less specific (e.g. a runtime shell entry read
+        // during a Speculative static attempt): its remaining holes are
+        // dynamic — no prefetch can fill them; they belong to the
+        // navigation-time dynamic request — so an upgrade would only
+        // re-fetch content the entry already has.
+        const isRuntimeCompleteRuntimePrefetchableSegment =
+          (nodeTree.prefetchHints & PrefetchHint.HasRuntimePrefetch) !== 0 &&
+          !nodeEntry.needsRuntimeRequest
 
         // Check if we should attempt to upgrade a fallback ISR response to
         // a concrete version.
@@ -1928,21 +2190,22 @@ function pingSegmentBundle(
 
         if (
           (nodeEntry.isPartial &&
+            !isRuntimeCompleteRuntimePrefetchableSegment &&
             canNewFetchStrategyProvideMoreContent(
               nodeEntry.fetchStrategy,
-              FetchStrategy.PPR
+              fetchStrategy
             )) ||
           isUpgradeableISRFallbackRetry
         ) {
           const revalidatingEntry = readOrCreateRevalidatingSegmentEntry(
             now,
-            FetchStrategy.PPR,
+            fetchStrategy,
             nodeTree
           )
           if (revalidatingEntry.status === EntryStatus.Empty) {
             upgradeToPendingSegment(
               revalidatingEntry,
-              FetchStrategy.PPR,
+              fetchStrategy,
               task._navigationLockPrefetch ?? null
             )
             node.entry = revalidatingEntry
@@ -1975,60 +2238,58 @@ function pingSegmentBundle(
     }
     node = node.parent
   }
-  if (!needsFetch) {
-    return
-  }
-  spawnPrefetchSubtask(
-    fetchSegmentsOnCacheMiss(
-      task,
-      route,
-      routeKey,
-      tree,
-      segments,
-      segmentCount
+  if (needsFetch) {
+    spawnPrefetchSubtask(
+      fetchSegmentsOnCacheMiss(
+        task,
+        route,
+        routeKey,
+        tree,
+        segments,
+        segmentCount,
+        fetchStrategy
+      )
     )
-  )
+  }
+  return needsRuntimeRequest
 }
 
 /**
  * During the tree walk, decide whether this segment should be added to the
  * in-progress bundle (if it has InlinedIntoChild) or finalize the bundle
- * and trigger a fetch (if it doesn't). Returns the updated bundle to pass
- * to children, or null if a fetch was triggered.
+ * and ping it, triggering a fetch if any of its entries need data (if it
+ * doesn't). Returns the updated bundle to pass to children (null if the
+ * bundle was finalized here), along with the needs-runtime signal from the
+ * bundle ping, if one happened (always false otherwise).
  */
 function accumulateSegmentBundle(
   now: number,
   task: PrefetchTask,
   route: FulfilledRouteCacheEntry,
   tree: RouteTree,
-  parentBundle: SegmentBundle | null
-): SegmentBundle | null {
-  // Static prefetching is disabled for this segment (runtime prefetch or
-  // instant = false). It participates in the bundle chain with null
-  // tree/entry — no cache entry is created, and the server emits null for
-  // this slot. This check is intentionally NOT gated by the prefetch
-  // inlining feature flag: we never statically prefetch segments that are
-  // runtime-prefetched or unprefetchable, regardless of bundling.
+  parentBundle: SegmentBundle | null,
+  // Per-pass static walk strategy; see pingRootRouteTree where it's derived.
+  // PPR for the normal static bundling walk; StaticShell during the Shell
+  // phase's static App Shell attempt, whose entries are keyed at the shell
+  // vary paths.
+  fetchStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell
+): { bundle: SegmentBundle | null; needsRuntimeRequest: boolean } {
+  // Prefetching is disabled for this segment (prefetch: 'force-disabled'):
+  // the server emits null for its slot, and it participates in the bundle
+  // chain with null tree/entry so the null-slot positions line up.
+  // (Allow-runtime segments are NOT in this mask — the server emits static
+  // data for them unconditionally.) Intentionally not gated by the prefetch
+  // inlining flag: we never statically prefetch unprefetchable segments.
   if (tree.prefetchHints & StaticPrefetchDisabled) {
     return {
-      tree: null,
-      entry: null,
-      parent: parentBundle,
+      bundle: { tree: null, entry: null, parent: parentBundle },
+      needsRuntimeRequest: false,
     }
   }
 
-  if (task.phase === PrefetchPhase.Shell) {
-    // The static-bundle path is for per-segment static (PPR) prefetches.
-    // Shell phase issues a single combined RuntimeShell request via
-    // pingRoute's runtime gate block — it neither needs nor wants the
-    // static bundle entries (which would be Pending PPR at concrete
-    // keypaths, blocking the RuntimeShell request and missing the shell
-    // vary-path placement we need for Fallback reuse). Skip entirely.
-    return null
-  }
   const segment = readOrCreateSegmentCacheEntry(
     now,
-    task.fetchStrategy,
+    fetchStrategy,
     tree,
     task._navigationLockPrefetch ?? null
   )
@@ -2038,9 +2299,15 @@ function accumulateSegmentBundle(
     tree.prefetchHints & PrefetchHint.InlinedIntoChild
   ) {
     return {
-      tree,
-      entry: segment,
-      parent: parentBundle,
+      bundle: { tree, entry: segment, parent: parentBundle },
+      // No bundle ping happens here, but the node's own entry may already be
+      // fulfilled and insufficient. Report that signal directly: the chain
+      // ping only reaches the terminal descendant, and if that descendant is
+      // itself a decision point it consumes the signal for its own subtree,
+      // leaving this ancestor's insufficiency invisible to the decision
+      // point above it.
+      needsRuntimeRequest:
+        segment.status === EntryStatus.Fulfilled && segment.needsRuntimeRequest,
     }
   }
 
@@ -2056,7 +2323,7 @@ function accumulateSegmentBundle(
       tree: route.metadata,
       entry: readOrCreateSegmentCacheEntry(
         now,
-        FetchStrategy.PPR,
+        fetchStrategy,
         route.metadata,
         task._navigationLockPrefetch ?? null
       ),
@@ -2070,8 +2337,16 @@ function accumulateSegmentBundle(
     parent: effectiveParent,
   }
 
-  pingSegmentBundle(now, task, route, task.key, tree, segments)
-  return null
+  const needsRuntimeRequest = pingSegmentBundle(
+    now,
+    task,
+    route,
+    task.key,
+    tree,
+    segments,
+    fetchStrategy
+  )
+  return { bundle: null, needsRuntimeRequest }
 }
 
 function finishStaticBundleOnRuntimeBailout(
@@ -2079,17 +2354,20 @@ function finishStaticBundleOnRuntimeBailout(
   task: PrefetchTask,
   route: FulfilledRouteCacheEntry,
   tree: RouteTree,
-  parentBundle: SegmentBundle
+  parentBundle: SegmentBundle,
+  // The same static walk strategy the parent bundle was accumulated with.
+  // Any needs-runtime signal from finishing the bundle is dropped: the
+  // caller is already deopting this subtree to a runtime prefetch.
+  fetchStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell
 ): void {
-  if (task.phase === PrefetchPhase.Shell) {
-    // Same reason as the gate in accumulateSegmentBundle: no static-bundle
-    // work during Shell phase. (Should already be unreachable since
-    // accumulateSegmentBundle returns null during Shell, leaving every
-    // parentBundle null at the runtime-bailout call site — gating here
-    // as defense in depth.)
-    return
-  }
-  const bundle = accumulateSegmentBundle(now, task, route, tree, parentBundle)
+  const bundle = accumulateSegmentBundle(
+    now,
+    task,
+    route,
+    tree,
+    parentBundle,
+    fetchStrategy
+  ).bundle
   if (bundle === null) {
     return
   }
@@ -2097,7 +2375,14 @@ function finishStaticBundleOnRuntimeBailout(
     for (const parallelRouteKey in tree.slots) {
       const childTree = tree.slots[parallelRouteKey]
       if (childTree.prefetchHints & PrefetchHint.ParentInlinedIntoSelf) {
-        finishStaticBundleOnRuntimeBailout(now, task, route, childTree, bundle)
+        finishStaticBundleOnRuntimeBailout(
+          now,
+          task,
+          route,
+          childTree,
+          bundle,
+          fetchStrategy
+        )
         return
       }
     }
